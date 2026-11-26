@@ -25,7 +25,8 @@ android {
             isEnable = true
             reset()
             include("arm64-v8a", "armeabi-v7a", "x86_64")
-            isUniversalApk = false
+            // 额外产出一个包含全部 ABI 的通包，避免用户选错 ABI 导致安装异常
+            isUniversalApk = true
         }
     }
 

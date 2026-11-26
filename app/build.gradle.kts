@@ -1,11 +1,16 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
     namespace = "com.pcxx.hy2box"
     compileSdk = 34
+
+    buildFeatures {
+        compose = true
+    }
 
     defaultConfig {
         applicationId = "com.pcxx.hy2box"

@@ -24,15 +24,32 @@ jobs:
           toolchain: stable
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+      - name: Install cargo-ndk (prebuilt)
+        id: ndk-prebuilt
+        continue-on-error: true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Install cargo-ndk (source fallback)
+        if: steps.ndk-prebuilt.outcome != 'success'
+        run: cargo install cargo-ndk
+
+      - name: Verify cargo-ndk
+        run: cargo ndk --version
 
       - name: Set up Android SDK + NDK
         uses: android-actions/setup-android@v3
 
+      - name: Accept SDK licenses
+        # sdkmanager 首次安装若不先接受 license 会直接失败，这是最常见的坑
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
       - name: Install SDK packages
-        run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
+
+      - name: Show NDK path (debug)
+        run: echo "ANDROID_HOME=$ANDROID_HOME" && ls -d $ANDROID_HOME/ndk/* 2>/dev/null || true
 
       - name: Build Rust core for Android ABIs
         run: |

@@ -49,9 +49,9 @@ jobs:
           ls "$ANDROID_HOME/build-tools" || true
           echo "--- ndk versions ---"
           ls "$ANDROID_HOME/ndk" || true
-          NDK_DIR=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -n1)
-          echo "Using NDK: $NDK_DIR"
-          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          # runner 已预设 ANDROID_NDK_ROOT，不要手动设 ANDROID_NDK_HOME，
+          # 否则两者版本不一致会让 cargo-ndk 报警告
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
 
       - name: Build Rust core for Android ABIs
         # cargo ndk 不识别 --manifest-path，必须 cd 进 crate 目录再执行

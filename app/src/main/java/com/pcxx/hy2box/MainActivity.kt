@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,12 +18,23 @@ import androidx.compose.ui.unit.dp
 class MainActivity : ComponentActivity() {
     private lateinit var store: ConfigStore
     private var status by mutableStateOf("未连接")
+    private val handler = Handler(Looper.getMainLooper())
+
+    private val statusPoll = object : Runnable {
+        override fun run() {
+            status = TunnelStatus.text
+            handler.postDelayed(this, 400)
+        }
+    }
 
     private val vpnLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) startVpn()
-        else status = "VPN 权限被拒绝"
+        else {
+            TunnelStatus.text = "VPN 权限被拒绝"
+            status = TunnelStatus.text
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -34,7 +47,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Column(Modifier.padding(20.dp)) {
-                    Text("hy2box · Stage 1", style = MaterialTheme.typography.titleLarge)
+                    Text("hy2box · 隧道握手验证", style = MaterialTheme.typography.titleLarge)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Stage 1.5：只验证节点与 hy2 隧道，不接管流量，不会断网，也不能上网。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
                     Spacer(Modifier.height(16.dp))
                     OutlinedTextField(
                         value = serverInput,
@@ -52,22 +70,52 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(16.dp))
                     Button(onClick = {
                         store.save(Hy2Config(serverInput, authInput))
+                        TunnelStatus.text = "正在启动…"
                         val intent = VpnService.prepare(this@MainActivity)
                         if (intent != null) vpnLauncher.launch(intent) else startVpn()
                     }, modifier = Modifier.fillMaxWidth()) {
-                        Text("连接")
+                        Text("验证隧道")
                     }
                     Spacer(Modifier.height(8.dp))
-                    Button(onClick = { stopService(Intent(this@MainActivity, Hy2VpnService::class.java).apply {
-                        action = Hy2VpnService.ACTION_DISCONNECT
-                    }); status = "已断开" }, modifier = Modifier.fillMaxWidth()) {
+                    Button(onClick = {
+                        stopService(Intent(this@MainActivity, Hy2VpnService::class.java).apply {
+                            action = Hy2VpnService.ACTION_DISCONNECT
+                        })
+                        TunnelStatus.text = "已断开"
+                        status = "已断开"
+                    }, modifier = Modifier.fillMaxWidth()) {
                         Text("断开")
                     }
-                    Spacer(Modifier.height(16.dp))
-                    Text("状态：$status")
+                    Spacer(Modifier.height(20.dp))
+                    Text("握手结果", style = MaterialTheme.typography.labelLarge)
+                    Spacer(Modifier.height(6.dp))
+                    Card(Modifier.fillMaxWidth()) {
+                        Text(
+                            status,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(14.dp)
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "看到「隧道通」说明节点地址、密码、服务端 hy2 都正常；" +
+                            "看到「握手失败」请核对地址与密码。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        handler.removeCallbacks(statusPoll)
+        handler.post(statusPoll)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(statusPoll)
+        super.onPause()
     }
 
     private fun startVpn() {
@@ -75,6 +123,7 @@ class MainActivity : ComponentActivity() {
             action = Hy2VpnService.ACTION_CONNECT
         }
         startForegroundService(intent)
-        status = "连接中（Stage 1 smoke test，日志见 logcat: hy2core）"
+        TunnelStatus.text = "正在启动…"
+        status = "正在启动…"
     }
 }

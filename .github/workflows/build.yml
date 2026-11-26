@@ -64,13 +64,16 @@ jobs:
             -o ../app/src/main/jniLibs \
             build --release
 
-      - name: Build APK
-        # 网页上传不会保留 gradlew 的可执行位，用 bash 调用避免 Permission denied
-        run: bash ./gradlew assembleRelease --no-daemon --stacktrace
+      - name: Build APK (signed)
+        # 1) 网页上传不会保留 gradlew 的可执行位，用 bash 调用避免 Permission denied
+        # 2) 用 assembleDebug：release 无 signingConfig 会产出 unsigned APK，
+        #    Android 拒绝安装（一加/ColorOS 提示「安装包异常」）。
+        #    debug 变体由 AGP 自动用 debug keystore 做 v2/v3 签名，可直接安装。
+        run: bash ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hy2box-stage1-apk
-          path: app/build/outputs/apk/release/*.apk
+          name: hy2box-stage1-signed-apk
+          path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error

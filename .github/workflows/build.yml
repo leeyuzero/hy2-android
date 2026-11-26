@@ -65,7 +65,8 @@ jobs:
             build --release
 
       - name: Build APK
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        # 网页上传不会保留 gradlew 的可执行位，用 bash 调用避免 Permission denied
+        run: bash ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4

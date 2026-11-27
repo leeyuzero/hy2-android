@@ -16,14 +16,7 @@ class Hy2VpnService : VpnService() {
     private var enginePtr: Long = 0L
     private val handler = Handler(Looper.getMainLooper())
 
-    @Volatile
-    private var probing = false
-    private var probeThread: Thread? = null
-
-    @Volatile
-    private var probeSocket: java.net.DatagramSocket? = null
-
-    // 每 400ms 把 Rust 侧状态（握手 + TUN 包计数）同步给界面
+    // 每 400ms 把 Rust 侧状态（握手 + TUN 计数 + 连接数）同步给界面
     private val statusPoll = object : Runnable {
         override fun run() {
             if (enginePtr != 0L) {
@@ -60,14 +53,26 @@ class Hy2VpnService : VpnService() {
             return
         }
 
-        // Stage 2 · Step 1：只劫持保留测试网段 198.18.0.0/16，
-        // 全局上网不受影响；探测包会写入 TUN，供 Rust 侧读取计数。
-        // 不加 addDisallowedApplication，否则 App 自身探测包不会进 TUN。
+        // 必须先建立 hy2 客户端，数据面线程要复用同一个可重连客户端
+        if (!Hy2Bridge.nativeStart(enginePtr, config.server, config.auth)) {
+            TunnelStatus.text = "客户端初始化失败：配置读取异常"
+            return
+        }
+
+        // Stage 2 · Step 2：恢复全局路由，所有 App 流量进 TUN。
+        // - 虚拟 DNS 10.0.0.1:53 由 Rust 侧转成 DNS-over-TCP 走隧道
+        // - 必须排除自身，否则 hy2 的 QUIC 流量也被劫持进 TUN 造成回环死锁
         val builder = Builder()
             .setSession("hy2box")
             .setMtu(1500)
-            .addAddress("10.0.0.2", 32)
-            .addRoute("198.18.0.0", 16)
+            .addAddress("10.0.0.2", 24)
+            .addRoute("0.0.0.0", 0)
+            .addDnsServer("10.0.0.1")
+        try {
+            builder.addDisallowedApplication(packageName)
+        } catch (e: Exception) {
+            android.util.Log.w("hy2box", "addDisallowedApplication failed", e)
+        }
 
         val pfd = builder.establish()
         if (pfd == null) {
@@ -80,69 +85,17 @@ class Hy2VpnService : VpnService() {
         tun = null
 
         if (!Hy2Bridge.nativeAttachTun(enginePtr, fd)) {
-            TunnelStatus.text = "TUN fd 挂载失败"
+            TunnelStatus.text = "TUN fd 挂载失败：客户端未就绪"
             ParcelFileDescriptor.adoptFd(fd).close()
             return
         }
 
-        // 握手目标不在测试网段，仍走真实网络，不受 TUN 影响
-        Hy2Bridge.nativeStart(enginePtr, config.server, config.auth)
-        startProbe()
         handler.removeCallbacks(statusPoll)
         handler.post(statusPoll)
     }
 
-    // 定时往测试网段发 UDP 包，产生确定性的 TUN 入站流量
-    private fun startProbe() {
-        stopProbe()
-        probing = true
-        val sock = java.net.DatagramSocket()
-        probeSocket = sock
-        probeThread = Thread {
-            try {
-                // 故意不调用 protect()，让这个包进入 TUN
-                val addr = java.net.InetAddress.getByName("198.18.0.1")
-                val payload = ByteArray(32)
-                val packet = java.net.DatagramPacket(payload, payload.size, addr, 53)
-                while (probing && !Thread.currentThread().isInterrupted) {
-                    try {
-                        sock.send(packet)
-                    } catch (_: Exception) {
-                    }
-                    try {
-                        Thread.sleep(200)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
-                }
-            } catch (t: Throwable) {
-                android.util.Log.w("hy2box", "probe thread ended", t)
-            } finally {
-                try {
-                    sock.close()
-                } catch (_: Exception) {
-                }
-            }
-        }.apply {
-            isDaemon = true
-            start()
-        }
-    }
-
-    private fun stopProbe() {
-        probing = false
-        probeThread?.interrupt()
-        probeThread = null
-        try {
-            probeSocket?.close()
-        } catch (_: Exception) {
-        }
-        probeSocket = null
-    }
-
     private fun disconnect() {
         handler.removeCallbacks(statusPoll)
-        stopProbe()
         Hy2Bridge.nativeDetachTun(enginePtr)
         Hy2Bridge.nativeStop(enginePtr)
         // fd 已交给 Rust 并由其关闭，这里不要重复 close
@@ -180,7 +133,7 @@ class Hy2VpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val text = "Step 1：TUN fd 通道验证"
+        val text = "Step 2：全局流量经 hy2 隧道"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("hy2box")

@@ -47,12 +47,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Column(Modifier.padding(20.dp)) {
-                    Text("hy2box · Stage 2 / Step 1", style = MaterialTheme.typography.titleLarge)
+                    Text("hy2box · Stage 2 / Step 2", style = MaterialTheme.typography.titleLarge)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "只劫持测试网段 198.18.0.0/16 并定时发探测包，手机不断网。" +
-                            "状态里「TUN fd 已收到 N 个 IP 包」在涨，即说明 fd 通道打通。" +
-                            "本步只计数、不转发，所以还不能通过隧道上网。",
+                        "全局流量经 hy2 隧道：TCP 由 smoltcp 还原后转发，DNS 转成 TCP 走隧道。" +
+                            "点连接后用浏览器打开网页，能打开即通过。本步暂不处理 UDP 与 IPv6。",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(16.dp))
@@ -76,7 +75,7 @@ class MainActivity : ComponentActivity() {
                         val intent = VpnService.prepare(this@MainActivity)
                         if (intent != null) vpnLauncher.launch(intent) else startVpn()
                     }, modifier = Modifier.fillMaxWidth()) {
-                        Text("启动通道验证")
+                        Text("连接（全局上网）")
                     }
                     Spacer(Modifier.height(8.dp))
                     Button(onClick = {
@@ -89,7 +88,7 @@ class MainActivity : ComponentActivity() {
                         Text("断开")
                     }
                     Spacer(Modifier.height(20.dp))
-                    Text("运行状态（握手 + TUN 包计数）", style = MaterialTheme.typography.labelLarge)
+                    Text("运行状态（握手 + 包数 / 连接数 / DNS）", style = MaterialTheme.typography.labelLarge)
                     Spacer(Modifier.height(6.dp))
                     Card(Modifier.fillMaxWidth()) {
                         Text(
@@ -100,9 +99,9 @@ class MainActivity : ComponentActivity() {
                     }
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "看到「TUN fd：已收到 N 个 IP 包」且数字持续增加 = Step 1 通过；" +
-                            "一直是 0 请用 logcat 看 hy2core 的 tun packet 日志。" +
-                            "握手结果仅为附带验证，不影响本步判定。",
+                        "验收：浏览器能打开网页，且「TCP 连接」数字随访问增长。" +
+                            "打不开时看「DNS 查询」是否 > 0（为 0 说明 DNS 没进隧道），" +
+                            "并用 adb logcat -s hy2core 看 new tcp conn / tcp_connect 日志。",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

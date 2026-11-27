@@ -13,6 +13,7 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, Mutex};
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::time::timeout;
+use serde::Deserialize;
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
@@ -60,6 +61,8 @@ struct Engine {
     // 数据面 OS 线程：destroy 前必须先 stop 并 join，避免 Runtime 先于线程销毁
     stack_thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
     client: StdMutex<Option<Arc<rsteria2::ReconnectableClient>>>,
+    // 当前生效配置的摘要：nativeGetStatus 会常驻回显，便于确认配置真的传进内核
+    config_summary: Arc<StdMutex<String>>,
 }
 
 fn set_status(status: &Arc<StdMutex<String>>, text: impl Into<String>) {
@@ -1099,6 +1102,111 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
     log::info!("stack stopped fd={}", raw);
 }
 
+// ---------- 配置项暴露 ----------
+// rsteria2::Config 只 #[derive(Debug, Clone)]、没有 Deserialize，
+// 所以不能直接 serde_json::from_str::<rsteria2::Config>()。
+// 这里定义一份「界面镜像结构体」，字段名与 ConfigStore.kt 的 JSONObject key 一一对应，
+// 解析 + 校验通过后再映射成真正的 rsteria2::Config。
+#[derive(Deserialize)]
+struct UiConfig {
+    #[serde(default)] server: String,
+    #[serde(default)] auth: String,
+    #[serde(default)] server_name: String,
+    #[serde(default)] insecure: bool,
+    /// 上传带宽，单位 Mbps；0 = 走 BBR。映射时换算成 bytes/sec。
+    #[serde(default)] tx_mbps: u64,
+    /// 下载带宽，单位 Mbps；0 = 让服务端自行测速。
+    #[serde(default)] rx_mbps: u64,
+    #[serde(default)] obfs_password: String,
+    #[serde(default)] hop_ports: String,
+    #[serde(default)] hop_interval_min_secs: u64,
+    #[serde(default)] hop_interval_max_secs: u64,
+    #[serde(default = "default_true")] fast_open: bool,
+    #[serde(default)] pin_sha256: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl UiConfig {
+    // panic = "abort"，这里只做返回 Result 的校验，绝不 unwrap / expect。
+    fn validate(&self) -> Result<(), String> {
+        if self.server.trim().is_empty() {
+            return Err("服务器地址不能为空".to_string());
+        }
+        if self.auth.is_empty() {
+            return Err("认证密码不能为空".to_string());
+        }
+        let obfs = self.obfs_password.trim();
+        if !obfs.is_empty() && obfs.len() < 4 {
+            return Err("混淆密码至少 4 个字节（Salamander 要求）".to_string());
+        }
+        let hop = self.hop_ports.trim();
+        if !hop.is_empty() && hop != "all" && hop != "*" {
+            let ok = hop
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ',' || c == '-' || c.is_ascii_whitespace());
+            if !ok {
+                return Err(
+                    "端口跳跃格式不合法；示例：20000-50000 / 443,8443,9000-9100 / all".to_string(),
+                );
+            }
+        }
+        let pin = self.pin_sha256.trim();
+        if !pin.is_empty() {
+            let hex: String = pin.chars().filter(|c| *c != ':').collect();
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("证书 SHA-256 Pin 必须是 64 位十六进制（可带冒号分隔）".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    // 1 Mbps = 1_000_000 bit/s = 125_000 byte/s；用饱和乘法防 u64 溢出。
+    fn to_rsteria(&self) -> rsteria2::Config {
+        rsteria2::Config {
+            server_addr: self.server.trim().to_string(),
+            server_name: self.server_name.trim().to_string(),
+            auth: self.auth.clone(),
+            insecure: self.insecure,
+            rx_bps: self.rx_mbps.saturating_mul(125_000),
+            tx_bps: self.tx_mbps.saturating_mul(125_000),
+            obfs_password: self.obfs_password.trim().to_string(),
+            hop_ports: self.hop_ports.trim().to_string(),
+            hop_interval_min_secs: self.hop_interval_min_secs,
+            hop_interval_max_secs: self.hop_interval_max_secs,
+            fast_open: self.fast_open,
+            pin_sha256: self.pin_sha256.trim().to_string(),
+            // ca_pem（PEM 文本过长，界面不暴露）与 quic 调参保持库默认值
+            ..Default::default()
+        }
+    }
+
+    // 状态卡常驻显示，用于确认 insecure / 带宽 / obfs 等确实传到了内核。
+    fn summary(&self) -> String {
+        format!(
+            "SNI={} · insecure={} · tx={}Mbps/rx={}Mbps · obfs={} · hop={} · fastOpen={} · pin={}",
+            if self.server_name.trim().is_empty() {
+                "自动".to_string()
+            } else {
+                self.server_name.trim().to_string()
+            },
+            if self.insecure { "开" } else { "关" },
+            self.tx_mbps,
+            self.rx_mbps,
+            if self.obfs_password.trim().is_empty() { "关" } else { "开" },
+            if self.hop_ports.trim().is_empty() {
+                "关".to_string()
+            } else {
+                self.hop_ports.trim().to_string()
+            },
+            if self.fast_open { "开" } else { "关" },
+            if self.pin_sha256.trim().is_empty() { "关" } else { "开" },
+        )
+    }
+}
+
 // ---------- JNI ----------
 
 #[no_mangle]
@@ -1112,6 +1220,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeInit(_env: JNIEnv, _class
         tun: StdMutex::new(None),
         stack_thread: StdMutex::new(None),
         client: StdMutex::new(None),
+        config_summary: Arc::new(StdMutex::new(String::new())),
     });
     Box::into_raw(engine) as jlong
 }
@@ -1121,14 +1230,9 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeStart(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong,
-    server: jni::objects::JString,
-    auth: jni::objects::JString,
+    config_json: jni::objects::JString,
 ) -> jboolean {
-    let server: String = match env.get_string(&server) {
-        Ok(s) => s.into(),
-        Err(_) => return false as jboolean,
-    };
-    let auth: String = match env.get_string(&auth) {
+    let json: String = match env.get_string(&config_json) {
         Ok(s) => s.into(),
         Err(_) => return false as jboolean,
     };
@@ -1137,19 +1241,34 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeStart(
     }
     let engine = unsafe { &*(ptr as *mut Engine) };
 
-    let cfg = rsteria2::Config {
-        server_addr: server,
-        auth,
-        ..Default::default()
+    // rsteria2::Config 无 Deserialize：先解析镜像结构体，再校验，再映射。
+    // 任何失败都写进 status 并返回 false，绝不 panic（panic = abort 会杀进程）。
+    let ui: UiConfig = match serde_json::from_str(&json) {
+        Ok(c) => c,
+        Err(e) => {
+            set_status(&engine.status, format!("配置解析失败：{}", e));
+            return false as jboolean;
+        }
     };
+    if let Err(e) = ui.validate() {
+        set_status(&engine.status, format!("配置无效：{}", e));
+        return false as jboolean;
+    }
+
+    let summary = ui.summary();
+    let cfg = ui.to_rsteria();
+
     // 数据面与握手验证共用同一个可重连客户端，连接只建一次
     let rc = Arc::new(rsteria2::ReconnectableClient::new(cfg));
     if let Ok(mut g) = engine.client.lock() {
         *g = Some(rc.clone());
     }
+    if let Ok(mut g) = engine.config_summary.lock() {
+        *g = summary.clone();
+    }
 
     let status = engine.status.clone();
-    set_status(&status, "正在握手…");
+    set_status(&status, format!("正在握手…\n配置：{}", summary));
     let task = engine.rt.spawn(async move {
         let probe = timeout(Duration::from_secs(15), rc.tcp_connect("ifconfig.me:80")).await;
         match probe {
@@ -1305,7 +1424,17 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
         } else {
             "\nTUN：状态锁异常".to_string()
         };
-        format!("{}{}", base, tun_info)
+        let cfg_line = engine
+            .config_summary
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let cfg_info = if cfg_line.is_empty() {
+            String::new()
+        } else {
+            format!("\n配置：{}", cfg_line)
+        };
+        format!("{}{}{}", base, cfg_info, tun_info)
     };
     match env.new_string(text) {
         Ok(s) => s.into_raw(),

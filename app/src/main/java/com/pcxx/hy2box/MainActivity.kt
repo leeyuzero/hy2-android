@@ -10,9 +10,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 
 class MainActivity : ComponentActivity() {
@@ -56,16 +61,31 @@ class MainActivity : ComponentActivity() {
         val cfg = store.load()
         var serverInput by mutableStateOf(cfg.server)
         var authInput by mutableStateOf(cfg.auth)
+        var sniInput by mutableStateOf(cfg.serverName)
+        var insecureInput by mutableStateOf(cfg.insecure)
+        var txInput by mutableStateOf(cfg.txMbps)
+        var rxInput by mutableStateOf(cfg.rxMbps)
+        var obfsInput by mutableStateOf(cfg.obfsPassword)
+        var hopInput by mutableStateOf(cfg.hopPorts)
+        var hopMinInput by mutableStateOf(cfg.hopMin)
+        var hopMaxInput by mutableStateOf(cfg.hopMax)
+        var fastOpenInput by mutableStateOf(cfg.fastOpen)
+        var pinInput by mutableStateOf(cfg.pinSha256)
+        var showAdvanced by mutableStateOf(false)
+        var configSummary by mutableStateOf(cfg.summary())
 
         setContent {
             MaterialTheme {
-                Column(Modifier.padding(20.dp)) {
-                    Text("hy2box · Stage 2 / Step 4", style = MaterialTheme.typography.titleLarge)
+                Column(
+                    Modifier
+                        .padding(20.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text("hy2box · 配置项版", style = MaterialTheme.typography.titleLarge)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "TCP / DNS / UDP 全部经 hy2 隧道；IPv6 已劫持并丢弃，不再绕隧道泄漏。" +
-                            "本步修复断开按钮，并加入流表超时清理与重连计数。" +
-                            "分片重组、MSS 钳制仍待后续。",
+                        "基础三项 + 展开「高级设置」可配置 insecure / 带宽 / obfs / 端口跳跃 / 证书 Pin。" +
+                            "所有配置以 JSON 传给 Rust 内核，状态卡会回显实际生效值。",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(16.dp))
@@ -73,6 +93,7 @@ class MainActivity : ComponentActivity() {
                         value = serverInput,
                         onValueChange = { serverInput = it },
                         label = { Text("服务器地址 (host:port)") },
+                        singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(8.dp))
@@ -80,11 +101,119 @@ class MainActivity : ComponentActivity() {
                         value = authInput,
                         onValueChange = { authInput = it },
                         label = { Text("认证密码") },
+                        singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = sniInput,
+                        onValueChange = { sniInput = it },
+                        label = { Text("TLS SNI / server_name（留空 = 取域名）") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(onClick = { showAdvanced = !showAdvanced }) {
+                        Text(
+                            if (showAdvanced) "收起高级设置 ▲"
+                            else "展开高级设置 ▼  insecure / 带宽 / obfs / 端口跳跃"
+                        )
+                    }
+                    if (showAdvanced) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("跳过证书校验 insecure（自签证书节点）", Modifier.weight(1f))
+                            Switch(checked = insecureInput, onCheckedChange = { insecureInput = it })
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = txInput,
+                            onValueChange = { txInput = it },
+                            label = { Text("上传带宽 Mbps（0 = BBR）") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = rxInput,
+                            onValueChange = { rxInput = it },
+                            label = { Text("下载带宽 Mbps（0 = 服务端测速）") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = obfsInput,
+                            onValueChange = { obfsInput = it },
+                            label = { Text("Salamander 混淆密码（空 = 关闭，至少 4 字节）") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = hopInput,
+                            onValueChange = { hopInput = it },
+                            label = { Text("端口跳跃（空 = 关闭；20000-50000 / 443,8443 / all）") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = hopMinInput,
+                            onValueChange = { hopMinInput = it },
+                            label = { Text("跳跃最小间隔秒（0 = 默认 30）") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = hopMaxInput,
+                            onValueChange = { hopMaxInput = it },
+                            label = { Text("跳跃最大间隔秒（0 = 固定为最小间隔）") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Fast Open（默认开）", Modifier.weight(1f))
+                            Switch(checked = fastOpenInput, onCheckedChange = { fastOpenInput = it })
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = pinInput,
+                            onValueChange = { pinInput = it },
+                            label = { Text("证书 SHA-256 Pin（64 位 hex，可带冒号；空 = 不 pin）") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "换算：1 Mbps = 125000 bytes/sec。tx>0 启用 Brutal 拥塞控制，0 走 BBR。" +
+                                "ca_pem（PEM 根证书）与 QUIC 调参暂不暴露，保持库默认。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
                     Button(onClick = {
-                        store.save(Hy2Config(serverInput, authInput))
+                        val current = Hy2Config(
+                            server = serverInput,
+                            auth = authInput,
+                            serverName = sniInput,
+                            insecure = insecureInput,
+                            txMbps = txInput,
+                            rxMbps = rxInput,
+                            obfsPassword = obfsInput,
+                            hopPorts = hopInput,
+                            hopMin = hopMinInput,
+                            hopMax = hopMaxInput,
+                            fastOpen = fastOpenInput,
+                            pinSha256 = pinInput,
+                        )
+                        store.save(current)
+                        configSummary = current.summary()
                         TunnelStatus.connected = true
                         TunnelStatus.text = "正在启动…"
                         status = "正在启动…"
@@ -110,7 +239,10 @@ class MainActivity : ComponentActivity() {
                         Text("断开")
                     }
                     Spacer(Modifier.height(20.dp))
-                    Text("运行状态（握手 + TCP / DNS / UDP / IPv6 / 重连）", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        "运行状态（握手 + 生效配置 + TCP / DNS / UDP / IPv6）",
+                        style = MaterialTheme.typography.labelLarge
+                    )
                     Spacer(Modifier.height(6.dp))
                     Card(Modifier.fillMaxWidth()) {
                         Text(
@@ -119,11 +251,12 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.padding(14.dp)
                         )
                     }
+                    Spacer(Modifier.height(8.dp))
+                    Text("已保存配置：$configSummary", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "验收：点「断开」后状态必须停在「已断开」不再跳动，VPN 图标消失、网页回到直连；" +
-                            "再点「连接」能重新握手。IPv6 丢弃计数在涨说明封堵生效。" +
-                            "DNS 计数为 0 时先关系统「私人 DNS」。",
+                        "验收：状态卡「配置：…」一行应与界面填写一致；改 insecure / 带宽 / obfs 后重连能握手成功即生效。" +
+                            "断开后状态停在「已断开」；DNS 计数为 0 时先关系统「私人 DNS」。",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

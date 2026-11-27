@@ -19,7 +19,9 @@ object Hy2Bridge {
     external fun nativeInit(): Long
     external fun nativeAttachTun(ptr: Long, fd: Int): Boolean
     external fun nativeDetachTun(ptr: Long)
-    external fun nativeStart(ptr: Long, server: String, auth: String): Boolean
+    // 配置项暴露：所有节点参数打包成一个 JSON 字符串传入，避免 JNI 参数爆炸。
+    // Rust 侧会解析为 UiConfig（rsteria2::Config 没有 Deserialize，不能直接反序列化）。
+    external fun nativeStart(ptr: Long, configJson: String): Boolean
     external fun nativeGetStatus(ptr: Long): String?
     external fun nativeStop(ptr: Long)
     external fun nativeDestroy(ptr: Long)

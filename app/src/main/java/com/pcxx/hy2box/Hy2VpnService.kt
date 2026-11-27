@@ -60,9 +60,12 @@ class Hy2VpnService : VpnService() {
             return
         }
 
-        // 必须先建立 hy2 客户端，数据面线程要复用同一个可重连客户端
-        if (!Hy2Bridge.nativeStart(enginePtr, config.server, config.auth)) {
-            TunnelStatus.text = "客户端初始化失败：配置读取异常"
+        // 必须先建立 hy2 客户端，数据面线程要复用同一个可重连客户端。
+        // 配置项暴露：全部参数打包成 JSON 一次传入；失败时把 Rust 侧的精确
+        // 校验错误（如混淆密码过短、端口跳跃格式错）回显到状态卡，而不是笼统报错。
+        if (!Hy2Bridge.nativeStart(enginePtr, config.toJson())) {
+            TunnelStatus.text = Hy2Bridge.nativeGetStatus(enginePtr)
+                ?: "客户端初始化失败：配置无效"
             return
         }
 
@@ -170,7 +173,7 @@ class Hy2VpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val text = "Step 4：TCP + UDP 全局经 hy2 隧道（IPv6 已封堵）"
+        val text = "配置项版：TCP + UDP 全局经 hy2 隧道（IPv6 已封堵）"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("hy2box")

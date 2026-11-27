@@ -23,6 +23,8 @@ const VIRTUAL_DNS: [u8; 4] = [10, 0, 0, 1];
 const DNS_UPSTREAM: &str = "8.8.8.8:53";
 const MTU: usize = 1500;
 const SOCK_BUF: usize = 32768;
+const UDP_POLL_MS: u64 = 20;
+const FLOW_MAP_MAX: usize = 4096;
 
 #[derive(Clone)]
 struct TunHandle {
@@ -31,6 +33,9 @@ struct TunHandle {
     bytes: Arc<AtomicU64>,
     conns: Arc<AtomicU64>,
     dns: Arc<AtomicU64>,
+    udp: Arc<AtomicU64>,       // 从 TUN 收到的 UDP 数据报数
+    udp_sent: Arc<AtomicU64>,  // 成功交给 UdpSession 发出的数据报数
+    udp_ok: Arc<AtomicBool>,   // 服务端是否通告了 UDP 转发能力
 }
 
 struct Engine {
@@ -77,20 +82,37 @@ fn syn_port(buf: &[u8]) -> Option<u16> {
     }
 }
 
-struct DnsReq {
+// 一个 UDP 流的两端（以 App 发出的方向记录）。
+// 构造应答时把 src/dst 互换即可，DNS 与普通 UDP 共用。
+#[derive(Clone, Copy)]
+struct LocalEp {
     src_ip: [u8; 4],
-    dst_ip: [u8; 4],
     src_port: u16,
-    payload: Vec<u8>,
+    dst_ip: [u8; 4],
+    dst_port: u16,
 }
 
-// 识别发往虚拟 DNS 的 UDP 53 查询，直接交给 DNS worker，不进 smoltcp
-fn parse_dns(buf: &[u8]) -> Option<DnsReq> {
+struct UdpReq {
+    ep: LocalEp,
+    payload: Vec<u8>,
+    target: String,      // 交给 UdpSession 的 "host:port"
+    dns_id: Option<u16>, // DNS 事务 ID，用于把并发应答精确送回原查询端口
+}
+
+// 解析一个完整（未分片）的 IPv4 UDP 包。
+// 虚拟 DNS 10.0.0.1:53 改写成上游 8.8.8.8:53，其余按原始目标转发。
+fn parse_udp(buf: &[u8]) -> Option<UdpReq> {
     if buf.len() < 28 || buf[0] >> 4 != 4 {
         return None;
     }
     let ihl = ((buf[0] & 0x0f) as usize) * 4;
     if ihl < 20 || buf.len() < ihl + 8 || buf[9] != 17 {
+        return None;
+    }
+    // IPv4 flags/fragment offset：MF(0x2000) 或 offset(0x1fff) 非 0 即为分片。
+    // 本步不做重组，分片包直接丢弃（避免构造出错误应答）。
+    let frag = u16::from_be_bytes([buf[6], buf[7]]);
+    if frag & 0x3fff != 0 {
         return None;
     }
     let mut src_ip = [0u8; 4];
@@ -100,18 +122,46 @@ fn parse_dns(buf: &[u8]) -> Option<DnsReq> {
     let u = &buf[ihl..];
     let src_port = u16::from_be_bytes([u[0], u[1]]);
     let dst_port = u16::from_be_bytes([u[2], u[3]]);
-    if dst_ip != VIRTUAL_DNS || dst_port != 53 {
-        return None;
-    }
     let ulen = u16::from_be_bytes([u[4], u[5]]) as usize;
     if ulen < 8 || ihl + ulen > buf.len() {
         return None;
     }
-    Some(DnsReq {
-        src_ip,
-        dst_ip,
-        src_port,
-        payload: buf[ihl + 8..ihl + ulen].to_vec(),
+    let payload = buf[ihl + 8..ihl + ulen].to_vec();
+
+    // 多播 / 广播 / 回环 / 本地 TUN 子网（虚拟 DNS 除外）不送去服务端。
+    if dst_ip[0] == 0
+        || dst_ip[0] == 127
+        || dst_ip[0] >= 224
+        || (dst_ip[0] == 10 && dst_ip[1] == 0 && dst_ip[2] == 0 && dst_ip[3] != 1)
+    {
+        return None;
+    }
+
+    let is_dns = dst_ip == VIRTUAL_DNS && dst_port == 53;
+    let target = if is_dns {
+        DNS_UPSTREAM.to_string()
+    } else {
+        format!(
+            "{}.{}.{}.{}:{}",
+            dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port
+        )
+    };
+    // DNS 头前 2 字节是事务 ID；UDP DNS 报文没有 TCP 那层长度前缀。
+    let dns_id = if is_dns && payload.len() >= 12 {
+        Some(u16::from_be_bytes([payload[0], payload[1]]))
+    } else {
+        None
+    };
+    Some(UdpReq {
+        ep: LocalEp {
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+        },
+        payload,
+        target,
+        dns_id,
     })
 }
 
@@ -131,8 +181,12 @@ fn ip_checksum(h: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-// 手工构造 IPv4 + UDP 应答写回 TUN（IPv4 的 UDP 校验和可为 0）
-fn build_dns_reply(req: &DnsReq, payload: &[u8]) -> Vec<u8> {
+// 手工构造 IPv4 + UDP 应答写回 TUN（含 UDP 伪首部校验和，部分 ROM 会校验）。
+fn build_udp_reply(ep: LocalEp, payload: &[u8]) -> Vec<u8> {
+    let src_ip = ep.dst_ip;
+    let src_port = ep.dst_port;
+    let dst_ip = ep.src_ip;
+    let dst_port = ep.src_port;
     let udp_len = 8 + payload.len();
     let total = 20 + udp_len;
     let mut p = vec![0u8; total];
@@ -141,19 +195,18 @@ fn build_dns_reply(req: &DnsReq, payload: &[u8]) -> Vec<u8> {
     p[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // Don't Fragment
     p[8] = 64;
     p[9] = 17; // UDP
-    p[12..16].copy_from_slice(&req.dst_ip);
-    p[16..20].copy_from_slice(&req.src_ip);
-    p[20..22].copy_from_slice(&53u16.to_be_bytes());
-    p[22..24].copy_from_slice(&req.src_port.to_be_bytes());
+    p[12..16].copy_from_slice(&src_ip);
+    p[16..20].copy_from_slice(&dst_ip);
+    p[20..22].copy_from_slice(&src_port.to_be_bytes());
+    p[22..24].copy_from_slice(&dst_port.to_be_bytes());
     p[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
     p[28..].copy_from_slice(payload);
     let c = ip_checksum(&p[..20]);
     p[10..12].copy_from_slice(&c.to_be_bytes());
 
-    // UDP 校验和（IPv4 伪首部）：部分 ROM 内核会校验，置 0 可能被拒收
     let mut pseudo = Vec::with_capacity(12 + udp_len);
-    pseudo.extend_from_slice(&req.dst_ip);
-    pseudo.extend_from_slice(&req.src_ip);
+    pseudo.extend_from_slice(&src_ip);
+    pseudo.extend_from_slice(&dst_ip);
     pseudo.extend_from_slice(&[0, 17]);
     pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
     pseudo.extend_from_slice(&p[20..]);
@@ -174,13 +227,23 @@ fn build_dns_reply(req: &DnsReq, payload: &[u8]) -> Vec<u8> {
     p
 }
 
+// TUN fd 会被三个线程写（smoltcp TxToken / UDP worker / DNS 降级 worker）。
+// 每次 write 对应一个完整 IP 包，用同一把锁保证包边界不被打散。
+fn write_tun(fd: i32, lock: &StdMutex<()>, pkt: &[u8]) {
+    if let Ok(_guard) = lock.lock() {
+        unsafe {
+            libc::write(fd, pkt.as_ptr() as *const libc::c_void, pkt.len());
+        }
+    }
+}
+
 // ---------- smoltcp Device：包装 TUN fd ----------
 
 struct Shared {
-    cache: VecDeque<Vec<u8>>,      // 等监听 socket 建好再投递的包
-    new_ports: VecDeque<u16>,      // 需要新建监听的端口
-    known_ports: HashSet<u16>,     // 已见过（已建过监听）的端口
-    dns_reqs: VecDeque<DnsReq>,
+    cache: VecDeque<Vec<u8>>, // 等监听 socket 建好再投递的 TCP SYN
+    new_ports: VecDeque<u16>,
+    known_ports: HashSet<u16>,
+    udp_reqs: VecDeque<UdpReq>, // 所有 UDP 包在此排队，由 tokio 侧转发
 }
 
 struct TunDevice {
@@ -188,6 +251,7 @@ struct TunDevice {
     shared: Rc<RefCell<Shared>>,
     packets: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
+    write_lock: Arc<StdMutex<()>>,
 }
 
 struct MyRxToken {
@@ -204,6 +268,7 @@ impl phy::RxToken for MyRxToken {
 
 struct MyTxToken {
     fd: i32,
+    write_lock: Arc<StdMutex<()>>,
 }
 impl phy::TxToken for MyTxToken {
     fn consume<R, F>(self, len: usize, f: F) -> R
@@ -212,9 +277,7 @@ impl phy::TxToken for MyTxToken {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        unsafe {
-            libc::write(self.fd, buffer.as_ptr() as *const libc::c_void, buffer.len());
-        }
+        write_tun(self.fd, &self.write_lock, &buffer);
         result
     }
 }
@@ -234,14 +297,18 @@ impl Device for TunDevice {
         {
             let mut sh = self.shared.borrow_mut();
             if let Some(pkt) = sh.cache.pop_front() {
-                return Some((MyRxToken { buffer: pkt }, MyTxToken { fd: self.fd }));
+                return Some((
+                    MyRxToken { buffer: pkt },
+                    MyTxToken {
+                        fd: self.fd,
+                        write_lock: self.write_lock.clone(),
+                    },
+                ));
             }
         }
 
         let mut buf = vec![0u8; 65536];
-        let n = unsafe {
-            libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
             return None; // O_NONBLOCK 下无数据
         }
@@ -249,9 +316,13 @@ impl Device for TunDevice {
         self.packets.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(n as u64, Ordering::Relaxed);
 
-        if let Some(req) = parse_dns(&buf) {
-            self.shared.borrow_mut().dns_reqs.push_back(req);
-            return None; // 不交给 smoltcp，由 DNS worker 处理
+        // 所有 IPv4 UDP 包都不进 smoltcp：可转发的交给 worker，其余直接丢弃。
+        // 不交给协议栈可避免 any_ip 下回 ICMP port unreachable 让 App 误判连接失败。
+        if buf.len() >= 20 && buf[0] >> 4 == 4 && buf[9] == 17 {
+            if let Some(req) = parse_udp(&buf) {
+                self.shared.borrow_mut().udp_reqs.push_back(req);
+            }
+            return None;
         }
 
         if let Some(port) = syn_port(&buf) {
@@ -265,15 +336,24 @@ impl Device for TunDevice {
             }
         }
 
-        Some((MyRxToken { buffer: buf }, MyTxToken { fd: self.fd }))
+        Some((
+            MyRxToken { buffer: buf },
+            MyTxToken {
+                fd: self.fd,
+                write_lock: self.write_lock.clone(),
+            },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(MyTxToken { fd: self.fd })
+        Some(MyTxToken {
+            fd: self.fd,
+            write_lock: self.write_lock.clone(),
+        })
     }
 }
 
-// ---------- 异步侧：TCP relay 与 DNS over TCP ----------
+// ---------- 异步侧：TCP relay、UDP 会话、DNS 降级 ----------
 
 struct Conn {
     to_remote: mpsc::Sender<Vec<u8>>,
@@ -306,78 +386,192 @@ async fn tcp_relay(
     }
 }
 
-async fn dns_worker(
+// 降级路径：服务端未通告 UDP 时，DNS 用 DNS over TCP 并发查询（每个查询独立 task）。
+async fn dns_tcp_query(
+    client: Arc<rsteria2::ReconnectableClient>,
+    req: UdpReq,
+    fd: i32,
+    lock: Arc<StdMutex<()>>,
+) {
+    let mut s = match timeout(Duration::from_secs(10), client.tcp_connect(DNS_UPSTREAM)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            log::warn!("dns(tcp) upstream connect failed: {}", e);
+            return;
+        }
+        Err(_) => {
+            log::warn!("dns(tcp) upstream connect timeout");
+            return;
+        }
+    };
+    let len = req.payload.len() as u16;
+    if s.write_all(&len.to_be_bytes()).await.is_err()
+        || s.write_all(&req.payload).await.is_err()
+    {
+        return;
+    }
+    let mut lb = [0u8; 2];
+    match timeout(Duration::from_secs(8), s.read_exact(&mut lb)).await {
+        Ok(Ok(_)) => {}
+        _ => return,
+    }
+    let n = u16::from_be_bytes(lb) as usize;
+    if n == 0 || n > 4096 {
+        return;
+    }
+    let mut resp = vec![0u8; n];
+    match timeout(Duration::from_secs(8), s.read_exact(&mut resp)).await {
+        Ok(Ok(_)) => {}
+        _ => return,
+    }
+    write_tun(fd, &lock, &build_udp_reply(req.ep, &resp));
+}
+
+async fn dns_tcp_worker(
     client: Arc<rsteria2::ReconnectableClient>,
     fd: i32,
-    dns_counter: Arc<AtomicU64>,
-    mut rx: mpsc::Receiver<DnsReq>,
+    lock: Arc<StdMutex<()>>,
+    mut rx: mpsc::Receiver<UdpReq>,
 ) {
-    let mut stream: Option<rsteria2::DuplexStream> = None;
     while let Some(req) = rx.recv().await {
-        dns_counter.fetch_add(1, Ordering::Relaxed);
-        let mut done = false;
-        for _ in 0..2 {
-            if stream.is_none() {
-                stream = match timeout(
-                    Duration::from_secs(10),
-                    client.tcp_connect(DNS_UPSTREAM),
-                )
-                .await
-                {
-                    Ok(Ok(s)) => Some(s),
-                    Ok(Err(e)) => {
-                        log::error!("dns upstream connect failed: {}", e);
-                        break;
-                    }
-                    Err(_) => {
-                        log::error!("dns upstream connect timeout");
-                        break;
-                    }
-                };
-            }
-            let s = match stream.as_mut() {
-                Some(s) => s,
-                None => break,
-            };
-            let len = req.payload.len() as u16;
-            if s.write_all(&len.to_be_bytes()).await.is_err()
-                || s.write_all(&req.payload).await.is_err()
-            {
-                stream = None;
-                continue;
-            }
-            let mut lb = [0u8; 2];
-            match timeout(Duration::from_secs(8), s.read_exact(&mut lb)).await {
-                Ok(Ok(_)) => {}
-                _ => {
-                    stream = None;
-                    continue;
-                }
-            }
-            let n = u16::from_be_bytes(lb) as usize;
-            if n == 0 || n > 4096 {
-                stream = None;
-                continue;
-            }
-            let mut resp = vec![0u8; n];
-            match timeout(Duration::from_secs(8), s.read_exact(&mut resp)).await {
-                Ok(Ok(_)) => {}
-                _ => {
-                    stream = None;
-                    continue;
-                }
-            }
-            let pkt = build_dns_reply(&req, &resp);
-            unsafe {
-                libc::write(fd, pkt.as_ptr() as *const libc::c_void, pkt.len());
-            }
-            done = true;
+        let c = client.clone();
+        let l = lock.clone();
+        tokio::spawn(async move {
+            dns_tcp_query(c, req, fd, l).await;
+        });
+    }
+}
+
+// 把降级期间收到的 DNS 请求继续转给 TCP worker（普通 UDP 只能丢弃）。
+async fn fallback_loop(
+    tun: TunHandle,
+    mut rx: mpsc::Receiver<UdpReq>,
+    dns_tcp_tx: mpsc::Sender<UdpReq>,
+) {
+    loop {
+        if tun.stop.load(Ordering::Relaxed) {
             break;
         }
-        if !done {
-            log::warn!("dns query dropped (upstream unavailable)");
+        match timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(req)) => {
+                if req.dns_id.is_some() && dns_tcp_tx.try_send(req).is_err() {
+                    log::warn!("dns fallback queue full, query dropped");
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {}
         }
     }
+}
+
+// 全局 UDP 会话：单个 task 独占 UdpSession（recv 需要 &mut self）。
+// 用「20ms 短等应答 + try_recv 批量发包」的轮询，避开 select! 里
+// recv(&mut) 与 send(&self) 同时借用 session 的冲突，编译期确定安全。
+async fn udp_worker(
+    client: Arc<rsteria2::ReconnectableClient>,
+    fd: i32,
+    lock: Arc<StdMutex<()>>,
+    tun: TunHandle,
+    mut rx: mpsc::Receiver<UdpReq>,
+    dns_tcp_tx: mpsc::Sender<UdpReq>,
+) {
+    let mut session: Option<rsteria2::UdpSession> = None;
+    for attempt in 0..3 {
+        match timeout(Duration::from_secs(10), client.udp()).await {
+            Ok(Ok(s)) => {
+                session = Some(s);
+                break;
+            }
+            Ok(Err(e)) => log::warn!("udp session unavailable (try {}): {}", attempt + 1, e),
+            Err(_) => log::warn!("udp session connect timeout (try {})", attempt + 1),
+        }
+    }
+    if session.is_none() {
+        tun.udp_ok.store(false, Ordering::Relaxed);
+        log::warn!("server has no UDP relay -> DNS falls back to TCP, other UDP dropped");
+        fallback_loop(tun.clone(), rx, dns_tcp_tx.clone()).await;
+        return;
+    }
+    tun.udp_ok.store(true, Ordering::Relaxed);
+    let mut session = session.unwrap();
+    let mut dns_map: HashMap<u16, LocalEp> = HashMap::new();
+    let mut flow_map: HashMap<String, LocalEp> = HashMap::new();
+    log::info!("udp relay session ready");
+
+    loop {
+        if tun.stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // 1) 短等一个远端应答（mpsc::Receiver::recv 可安全取消，超时不丢包）
+        let recv_res = timeout(Duration::from_millis(UDP_POLL_MS), session.recv()).await;
+        match recv_res {
+            Ok(Ok((payload, src))) => {
+                // DNS 应答按事务 ID 精确回给原查询端口，避免并发交错回错端口。
+                let by_dns = if src == DNS_UPSTREAM && payload.len() >= 12 {
+                    let id = u16::from_be_bytes([payload[0], payload[1]]);
+                    dns_map.remove(&id)
+                } else {
+                    None
+                };
+                let ep = by_dns.or_else(|| flow_map.get(&src).copied());
+                match ep {
+                    Some(ep) => write_tun(fd, &lock, &build_udp_reply(ep, &payload)),
+                    None => log::debug!("udp reply without local flow: {}", src),
+                }
+            }
+            Ok(Err(e)) => {
+                // QUIC 重连后旧 session 会失效，重建一个并清空映射表。
+                log::warn!("udp session lost: {} -> rebuilding", e);
+                let mut rebuilt = None;
+                for _ in 0..3 {
+                    match timeout(Duration::from_secs(10), client.udp()).await {
+                        Ok(Ok(s)) => {
+                            rebuilt = Some(s);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                match rebuilt {
+                    Some(s) => {
+                        session = s;
+                        dns_map.clear();
+                        flow_map.clear();
+                        log::info!("udp session rebuilt");
+                    }
+                    None => {
+                        tun.udp_ok.store(false, Ordering::Relaxed);
+                        log::warn!("udp rebuild failed -> DNS falls back to TCP");
+                        fallback_loop(tun.clone(), rx, dns_tcp_tx.clone()).await;
+                        return;
+                    }
+                }
+            }
+            Err(_) => {} // 20ms 无应答，正常
+        }
+
+        // 2) 批量排空本地待发的 UDP 包
+        while let Ok(req) = rx.try_recv() {
+            if dns_map.len() >= FLOW_MAP_MAX {
+                dns_map.clear();
+            }
+            if flow_map.len() >= FLOW_MAP_MAX {
+                flow_map.clear();
+            }
+            if let Some(id) = req.dns_id {
+                dns_map.insert(id, req.ep);
+            }
+            flow_map.insert(req.target.clone(), req.ep);
+            match session.send(&req.payload, &req.target) {
+                Ok(()) => {
+                    tun.udp_sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => log::warn!("udp send {} failed: {}", req.target, e),
+            }
+        }
+    }
+    log::info!("udp worker stopped");
 }
 
 // ---------- 同步侧：smoltcp 主循环（独占一个 OS 线程） ----------
@@ -391,33 +585,42 @@ fn set_nonblocking(fd: i32) {
     }
 }
 
-fn run_stack(
-    fd: i32,
-    client: Arc<rsteria2::ReconnectableClient>,
-    rt: Handle,
-    tun: TunHandle,
-) {
+fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tun: TunHandle) {
     set_nonblocking(fd);
     log::info!("stack started fd={}", fd);
 
+    let write_lock = Arc::new(StdMutex::new(()));
     let shared = Rc::new(RefCell::new(Shared {
         cache: VecDeque::new(),
         new_ports: VecDeque::new(),
         known_ports: HashSet::new(),
-        dns_reqs: VecDeque::new(),
+        udp_reqs: VecDeque::new(),
     }));
-    let (dns_tx, dns_rx) = mpsc::channel::<DnsReq>(64);
-    let dns_counter = tun.dns.clone();
-    let dns_client = client.clone();
-    rt.spawn(async move {
-        dns_worker(dns_client, fd, dns_counter, dns_rx).await;
-    });
+    let (udp_tx, udp_rx) = mpsc::channel::<UdpReq>(256);
+    let (dns_tcp_tx, dns_tcp_rx) = mpsc::channel::<UdpReq>(64);
+
+    {
+        let c = client.clone();
+        let l = write_lock.clone();
+        let t = tun.clone();
+        rt.spawn(async move {
+            udp_worker(c, fd, l, t, udp_rx, dns_tcp_tx).await;
+        });
+    }
+    {
+        let c = client.clone();
+        let l = write_lock.clone();
+        rt.spawn(async move {
+            dns_tcp_worker(c, fd, l, dns_tcp_rx).await;
+        });
+    }
 
     let mut device = TunDevice {
         fd,
         shared: shared.clone(),
         packets: tun.packets.clone(),
         bytes: tun.bytes.clone(),
+        write_lock: write_lock.clone(),
     };
 
     let mut config = IfaceConfig::new(HardwareAddress::Ip);
@@ -442,16 +645,21 @@ fn run_stack(
     let mut buf = vec![0u8; 16384];
 
     while !tun.stop.load(Ordering::Relaxed) {
-        // 1) 取走 Device 攒下的新端口与 DNS 请求（只登记端口，监听 socket 由第 2 步统一补齐）
+        // 1) 取走 Device 攒下的新端口与 UDP 请求
         let mut need_listen: Vec<u16> = Vec::new();
         {
             let mut sh = shared.borrow_mut();
             while let Some(p) = sh.new_ports.pop_front() {
                 sh.known_ports.insert(p);
             }
-            while let Some(req) = sh.dns_reqs.pop_front() {
-                if dns_tx.try_send(req).is_err() {
-                    log::warn!("dns queue full, query dropped");
+            while let Some(req) = sh.udp_reqs.pop_front() {
+                let is_dns = req.dns_id.is_some();
+                tun.udp.fetch_add(1, Ordering::Relaxed);
+                if is_dns {
+                    tun.dns.fetch_add(1, Ordering::Relaxed);
+                }
+                if udp_tx.try_send(req).is_err() {
+                    log::warn!("udp queue full, datagram dropped");
                 }
             }
         }
@@ -690,6 +898,9 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeAttachTun(
         bytes: Arc::new(AtomicU64::new(0)),
         conns: Arc::new(AtomicU64::new(0)),
         dns: Arc::new(AtomicU64::new(0)),
+        udp: Arc::new(AtomicU64::new(0)),
+        udp_sent: Arc::new(AtomicU64::new(0)),
+        udp_ok: Arc::new(AtomicBool::new(false)),
     };
     let thread_handle = handle.clone();
     let rt_handle = engine.rt.handle().clone();
@@ -740,13 +951,26 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
             .unwrap_or_else(|_| "状态读取失败".to_string());
         let tun_info = if let Ok(g) = engine.tun.lock() {
             match g.as_ref() {
-                Some(h) => format!(
-                    "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}",
-                    h.packets.load(Ordering::Relaxed),
-                    h.bytes.load(Ordering::Relaxed),
-                    h.conns.load(Ordering::Relaxed),
-                    h.dns.load(Ordering::Relaxed),
-                ),
+                Some(h) => {
+                    let udp = h.udp.load(Ordering::Relaxed);
+                    let mode = if h.udp_ok.load(Ordering::Relaxed) {
+                        "UDP 会话已启用"
+                    } else if udp > 0 {
+                        "UDP 未启用（服务端不支持，DNS 已降级为 TCP）"
+                    } else {
+                        "UDP 会话初始化中"
+                    };
+                    format!(
+                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {}",
+                        h.packets.load(Ordering::Relaxed),
+                        h.bytes.load(Ordering::Relaxed),
+                        h.conns.load(Ordering::Relaxed),
+                        h.dns.load(Ordering::Relaxed),
+                        udp,
+                        h.udp_sent.load(Ordering::Relaxed),
+                        mode,
+                    )
+                }
                 None => "\nTUN：数据面未启动".to_string(),
             }
         } else {

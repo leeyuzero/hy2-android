@@ -59,8 +59,9 @@ class Hy2VpnService : VpnService() {
             return
         }
 
-        // Stage 2 · Step 2：恢复全局路由，所有 App 流量进 TUN。
-        // - 虚拟 DNS 10.0.0.1:53 由 Rust 侧转成 DNS-over-TCP 走隧道
+        // Stage 2 · Step 3：恢复全局路由，所有 App 流量进 TUN。
+        // - 虚拟 DNS 10.0.0.1:53 与全局 UDP 由 Rust 侧经 hy2 UdpSession 转发
+        //   （服务端未通告 UDP 时，Rust 侧自动把 DNS 降级为 DNS-over-TCP）
         // - 必须排除自身，否则 hy2 的 QUIC 流量也被劫持进 TUN 造成回环死锁
         val builder = Builder()
             .setSession("hy2box")
@@ -133,7 +134,7 @@ class Hy2VpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val text = "Step 2：全局流量经 hy2 隧道"
+        val text = "Step 3：TCP + UDP 全局经 hy2 隧道"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("hy2box")

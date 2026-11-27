@@ -47,11 +47,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Column(Modifier.padding(20.dp)) {
-                    Text("hy2box · Stage 2 / Step 2", style = MaterialTheme.typography.titleLarge)
+                    Text("hy2box · Stage 2 / Step 3", style = MaterialTheme.typography.titleLarge)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "全局流量经 hy2 隧道：TCP 由 smoltcp 还原后转发，DNS 转成 TCP 走隧道。" +
-                            "点连接后用浏览器打开网页，能打开即通过。本步暂不处理 UDP 与 IPv6。",
+                        "TCP 由 smoltcp 还原后转发；DNS 与全局 UDP 经 hy2 UDP 会话转发。" +
+                            "若服务端未通告 UDP，DNS 自动降级为 TCP、其余 UDP 丢弃。" +
+                            "用浏览器 + 依赖 UDP 的 App 一起验收；本步仍不处理 IPv6。",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(16.dp))
@@ -88,7 +89,7 @@ class MainActivity : ComponentActivity() {
                         Text("断开")
                     }
                     Spacer(Modifier.height(20.dp))
-                    Text("运行状态（握手 + 包数 / 连接数 / DNS）", style = MaterialTheme.typography.labelLarge)
+                    Text("运行状态（握手 + TCP / DNS / UDP 计数）", style = MaterialTheme.typography.labelLarge)
                     Spacer(Modifier.height(6.dp))
                     Card(Modifier.fillMaxWidth()) {
                         Text(
@@ -99,9 +100,9 @@ class MainActivity : ComponentActivity() {
                     }
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "验收：浏览器能打开网页，且「TCP 连接」数字随访问增长。" +
-                            "打不开时看「DNS 查询」是否 > 0（为 0 说明 DNS 没进隧道），" +
-                            "并用 adb logcat -s hy2core 看 new tcp conn / tcp_connect 日志。",
+                        "验收：浏览器能打开网页，且「UDP 收到 / 已转发」随 QUIC 类 App 增长。" +
+                            "若显示「UDP 未启用」说明服务端没开 UDP，DNS 已降级但普通 UDP 不可用。" +
+                            "DNS 计数为 0 时先关系统「私人 DNS」；用 adb logcat -s hy2core 看 udp relay / udp send 日志。",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

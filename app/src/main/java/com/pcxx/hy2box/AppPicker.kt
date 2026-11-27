@@ -57,7 +57,7 @@ fun loadInstalledApps(ctx: Context): List<AppInfo> {
             system = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0,
         )
     }.sortedWith(
-        compareBy(String.CASE_INSENSITIVE_ORDER) { it.label }
+        compareBy<AppInfo> { it.label.lowercase() }
             .thenBy { it.pkg }
     )
 }
@@ -123,7 +123,9 @@ fun AppPickerDialog(
                                 Checkbox(
                                     checked = ai.pkg in checked,
                                     onCheckedChange = { on ->
-                                        checked = if (on) checked + ai.pkg else checked - ai.pkg
+                                        val next = checked.toMutableSet()
+                                        if (on) next.add(ai.pkg) else next.remove(ai.pkg)
+                                        checked = next
                                     },
                                 )
                                 Column(Modifier.weight(1f)) {

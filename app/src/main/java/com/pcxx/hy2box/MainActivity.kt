@@ -19,8 +19,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private lateinit var store: ConfigStore
@@ -81,7 +79,6 @@ class MainActivity : ComponentActivity() {
         var showPicker by mutableStateOf(false)
         var appRule by mutableStateOf(store.loadAppRule())
         var manualPkg by mutableStateOf("")
-        var installedApps by mutableStateOf(emptyList<AppInfo>())
         // 规则变化立即落盘，不需要用户额外点「保存」
         val updateRule: (AppRule) -> Unit = { next ->
             appRule = next
@@ -89,12 +86,8 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            // 枚举已安装应用放到 IO 线程，避免阻塞首帧
-            LaunchedEffect(Unit) {
-                installedApps = withContext(Dispatchers.IO) {
-                    loadInstalledApps(this@MainActivity)
-                }
-            }
+            // remember 只在首次组合时枚举一次；Compose 内不引入额外协程依赖
+            val installedApps = remember { loadInstalledApps(this@MainActivity) }
             MaterialTheme {
                 Column(
                     Modifier
@@ -268,7 +261,9 @@ class MainActivity : ComponentActivity() {
                             Button(onClick = {
                                 val p = manualPkg.trim()
                                 if (p.isNotBlank()) {
-                                    updateRule(appRule.copy(packages = appRule.packages + p))
+                                    val next = appRule.packages.toMutableSet()
+                                    next.add(p)
+                                    updateRule(appRule.copy(packages = next))
                                     manualPkg = ""
                                 }
                             }) { Text("添加") }
@@ -280,7 +275,9 @@ class MainActivity : ComponentActivity() {
                             Column {
                                 appRule.packages.sorted().forEach { pkg ->
                                     TextButton(onClick = {
-                                        updateRule(appRule.copy(packages = appRule.packages - pkg))
+                                        val next = appRule.packages.toMutableSet()
+                                        next.remove(pkg)
+                                        updateRule(appRule.copy(packages = next))
                                     }) {
                                         Text("✕ $pkg", style = MaterialTheme.typography.bodySmall)
                                     }

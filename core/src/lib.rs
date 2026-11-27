@@ -38,6 +38,12 @@ const UDP_SESSION_TIMEOUT_SECS: u64 = 10; // 建会话超时
 const TCP_IDLE_TTL_SECS: u64 = 300;
 const GC_INTERVAL_SECS: u64 = 5;          // dispatcher 清理已结束 / 超时的流
 
+// ---------- 批次 4-A：缓冲复用 + 事件驱动唤醒 ----------
+const RX_BUF_SIZE: usize = 2048;       // TUN 读缓冲：MTU=1500，2048 足够，且只分配一次
+const TX_STACK_SIZE: usize = 2048;     // 出站 TCP 包走栈缓冲，常规路径零堆分配
+const UDP_REPLY_CAP: usize = MTU + 64; // 每流一个复用应答缓冲的初始容量
+const POLL_MAX_WAIT_MS: u64 = 250;     // poll 超时上限：兼顾 stop 响应与空闲省电
+
 #[derive(Clone)]
 struct TunHandle {
     stop: Arc<AtomicBool>,
@@ -51,6 +57,7 @@ struct TunHandle {
     udp_flows: Arc<AtomicU64>, // 当前活跃的 per-flow UDP 会话数
     ipv6: Arc<AtomicU64>,       // 被封堵（丢弃）的 IPv6 包数
     reconnects: Arc<AtomicU64>, // UDP 会话失效 / 重建次数
+    wakes: Arc<AtomicU64>,      // 异步侧主动唤醒主循环的次数（验收事件驱动生效）
 }
 
 struct Engine {
@@ -190,31 +197,44 @@ fn parse_udp(buf: &[u8]) -> Option<UdpReq> {
     })
 }
 
-fn ip_checksum(h: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+// 4-A：把「累加 / 收尾」拆开，UDP 伪首部就能直接在累加器里算完，
+// 不再 Vec::with_capacity 拼一段临时缓冲。
+fn checksum_add(sum: &mut u32, data: &[u8]) {
     let mut i = 0;
-    while i + 1 < h.len() {
-        sum += u16::from_be_bytes([h[i], h[i + 1]]) as u32;
+    while i + 1 < data.len() {
+        *sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
         i += 2;
     }
-    if i < h.len() {
-        sum += (h[i] as u32) << 8;
+    if i < data.len() {
+        *sum += (data[i] as u32) << 8;
     }
+}
+
+fn checksum_finish(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
 }
 
-// 手工构造 IPv4 + UDP 应答写回 TUN（含 UDP 伪首部校验和，部分 ROM 会校验）。
-fn build_udp_reply(ep: LocalEp, payload: &[u8]) -> Vec<u8> {
+fn ip_checksum(h: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    checksum_add(&mut sum, h);
+    checksum_finish(sum)
+}
+
+// 4-A：手工构造 IPv4 + UDP 应答写入「调用方长期持有」的复用缓冲。
+// clear() + resize() 复用同一块堆内存，密集 DNS / UDP 应答零分配。
+fn build_udp_reply_into(out: &mut Vec<u8>, ep: LocalEp, payload: &[u8]) {
     let src_ip = ep.dst_ip;
     let src_port = ep.dst_port;
     let dst_ip = ep.src_ip;
     let dst_port = ep.src_port;
     let udp_len = 8 + payload.len();
     let total = 20 + udp_len;
-    let mut p = vec![0u8; total];
+    out.clear();
+    out.resize(total, 0);
+    let p = out.as_mut_slice();
     p[0] = 0x45;
     p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
     p[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // Don't Fragment
@@ -229,27 +249,22 @@ fn build_udp_reply(ep: LocalEp, payload: &[u8]) -> Vec<u8> {
     let c = ip_checksum(&p[..20]);
     p[10..12].copy_from_slice(&c.to_be_bytes());
 
-    let mut pseudo = Vec::with_capacity(12 + udp_len);
-    pseudo.extend_from_slice(&src_ip);
-    pseudo.extend_from_slice(&dst_ip);
-    pseudo.extend_from_slice(&[0, 17]);
-    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(&p[20..]);
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < pseudo.len() {
-        sum += u16::from_be_bytes([pseudo[i], pseudo[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < pseudo.len() {
-        sum += (pseudo[i] as u32) << 8;
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let uc = !(sum as u16);
+    // 伪首部 12 字节 + UDP 报文直接累加，不再分配临时 Vec。
+    let mut sum = 0u32;
+    checksum_add(&mut sum, &src_ip);
+    checksum_add(&mut sum, &dst_ip);
+    checksum_add(&mut sum, &[0u8, 17u8]);
+    checksum_add(&mut sum, &(udp_len as u16).to_be_bytes());
+    checksum_add(&mut sum, &p[20..]);
+    let uc = checksum_finish(sum);
     p[26..28].copy_from_slice(&(if uc == 0 { 0xffff } else { uc }).to_be_bytes());
-    p
+}
+
+// 降级 DNS over TCP 等一次性路径仍用这个包装。
+fn build_udp_reply(ep: LocalEp, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(UDP_REPLY_CAP);
+    build_udp_reply_into(&mut out, ep, payload);
+    out
 }
 
 // TUN fd 由 Arc<OwnedFd> 共享所有权：最后一个引用 drop 时才 close，
@@ -286,6 +301,27 @@ fn write_tun(fd: &Arc<OwnedFd>, lock: &StdMutex<()>, pkt: &[u8]) {
     log::warn!("tun write incomplete: {}/{} bytes", off, pkt.len());
 }
 
+// 4-A：异步侧唤醒主循环的句柄。write 为 None 表示 pipe 创建失败，
+// 主循环会自动退回 20ms 有界轮询，功能不受影响。
+#[derive(Clone)]
+struct Wake {
+    write: Option<Arc<OwnedFd>>,
+    count: Arc<AtomicU64>,
+}
+
+impl Wake {
+    fn fire(&self) {
+        if let Some(w) = &self.write {
+            let byte = [0u8; 1];
+            // 非阻塞写：管道满说明已有待处理事件，忽略 EAGAIN 即可。
+            unsafe {
+                libc::write(w.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1);
+            }
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 // ---------- smoltcp Device：包装 TUN fd ----------
 
 struct Shared {
@@ -302,6 +338,7 @@ struct TunDevice {
     bytes: Arc<AtomicU64>,
     ipv6: Arc<AtomicU64>,
     write_lock: Arc<StdMutex<()>>,
+    rx_buf: Vec<u8>, // 4-A：只分配一次的 TUN 读缓冲
 }
 
 struct MyRxToken {
@@ -325,10 +362,18 @@ impl phy::TxToken for MyTxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
-        let result = f(&mut buffer);
-        write_tun(&self.fd, &self.write_lock, &buffer);
-        result
+        // P1-5：常规包（<= MTU）走 2KB 栈缓冲，零堆分配；异常大包才退回堆。
+        if len <= TX_STACK_SIZE {
+            let mut stack = [0u8; TX_STACK_SIZE];
+            let result = f(&mut stack[..len]);
+            write_tun(&self.fd, &self.write_lock, &stack[..len]);
+            result
+        } else {
+            let mut buffer = vec![0u8; len];
+            let result = f(&mut buffer);
+            write_tun(&self.fd, &self.write_lock, &buffer);
+            result
+        }
     }
 }
 
@@ -361,18 +406,23 @@ impl Device for TunDevice {
                 }
             }
 
-            let mut buf = vec![0u8; 65536];
+            // 4-A：复用 rx_buf，不再每包分配并清零 64KB。MyRxToken 必须拥有
+            // 数据，所以 still 需要一次只拷 n 字节的 to_vec()，但分配量从
+            // 「每包 64KB」降到「全程一次 2KB + 每包 n 字节」。
+            // VpnService MTU 已固定 1500，2048 缓冲不会截断 IP 包。
+            let rx_len = self.rx_buf.len();
+            let rx_ptr = self.rx_buf.as_mut_ptr();
             let n = unsafe {
                 libc::read(
                     self.fd.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
+                    rx_ptr as *mut libc::c_void,
+                    rx_len,
                 )
             };
             if n <= 0 {
                 return None; // O_NONBLOCK 下无数据
             }
-            buf.truncate(n as usize);
+            let mut buf = self.rx_buf[..n as usize].to_vec();
             self.packets.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(n as u64, Ordering::Relaxed);
 
@@ -445,6 +495,7 @@ async fn tcp_relay(
     mut to_rx: mpsc::Receiver<Vec<u8>>,
     from_tx: mpsc::Sender<Vec<u8>>,
     connected: Arc<AtomicBool>,
+    wake: Wake,
 ) {
     connected.store(true, Ordering::Relaxed);
     let (mut r, mut w) = tokio::io::split(stream);
@@ -472,6 +523,8 @@ async fn tcp_relay(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if from_tx.send(buf[..n].to_vec()).await.is_err() { break; }
+                    // 4-A：远端数据已进 channel，立刻唤醒主循环搬运到 smoltcp socket。
+                    wake.fire();
                 }
             },
         }
@@ -479,6 +532,9 @@ async fn tcp_relay(
     if !write_closed {
         let _ = w.shutdown().await;
     }
+    // 无论正常结束还是异常断开都唤醒：让主循环立刻看到 from_remote 的
+    // Disconnected 并发出 FIN / RST，不用等下一次定时轮询。
+    wake.fire();
 }
 
 // 降级路径：服务端未通告 UDP 时，DNS 用 DNS over TCP 并发查询（每个查询独立 task）。
@@ -589,6 +645,8 @@ async fn flow_task(
     let idle_dur = Duration::from_secs(idle_secs);
     let mut idle = tokio::time::sleep(idle_dur);
     tokio::pin!(idle);
+    // 本流复用同一个应答缓冲：DNS / UDP 密集回包时不再每个包分配 Vec。
+    let mut reply: Vec<u8> = Vec::with_capacity(UDP_REPLY_CAP);
 
     loop {
         if tun.stop.load(Ordering::Relaxed) {
@@ -610,7 +668,8 @@ async fn flow_task(
             // 这个 session 只服务本四元组，应答必然回给 ep 记录的本地端点。
             FlowEvent::Reply(payload) => {
                 if !tun.stop.load(Ordering::Relaxed) {
-                    write_tun(&fd, &lock, &build_udp_reply(ep, &payload));
+                    build_udp_reply_into(&mut reply, ep, &payload);
+                    write_tun(&fd, &lock, &reply);
                 }
             }
             FlowEvent::Out(req) => match session.send(&req.payload, &req.target) {
@@ -789,6 +848,35 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
     let raw = fd.as_raw_fd();
     log::info!("stack started fd={}", raw);
 
+    // 4-A：创建非阻塞 pipe 作为「异步侧 -> 主循环」的唤醒通道。
+    // pipe() 是 POSIX 标准符号，不依赖 eventfd，Android / Linux 均可用。
+    // 创建失败时 wake_* 全为 None，主循环自动退回 20ms 有界轮询。
+    let mut wake_fds = [0i32; 2];
+    let wake_ok = unsafe { libc::pipe(wake_fds.as_mut_ptr()) } == 0;
+    if wake_ok {
+        unsafe {
+            for f in wake_fds.iter() {
+                let flags = libc::fcntl(*f, libc::F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(*f, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+    } else {
+        log::warn!("wake pipe creation failed, fallback to 20ms bounded polling");
+    }
+    // OwnedFd 接管：run_stack 退出时自动 close，不泄漏 fd。
+    let wake_read = if wake_ok {
+        Some(unsafe { OwnedFd::from_raw_fd(wake_fds[0]) })
+    } else {
+        None
+    };
+    let wake_write = if wake_ok {
+        Some(Arc::new(unsafe { OwnedFd::from_raw_fd(wake_fds[1]) }))
+    } else {
+        None
+    };
+
     let write_lock = Arc::new(StdMutex::new(()));
     let shared = Rc::new(RefCell::new(Shared {
         cache: VecDeque::new(),
@@ -825,6 +913,7 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
         bytes: tun.bytes.clone(),
         ipv6: tun.ipv6.clone(),
         write_lock: write_lock.clone(),
+        rx_buf: vec![0u8; RX_BUF_SIZE],
     };
 
     let mut config = IfaceConfig::new(HardwareAddress::Ip);
@@ -847,6 +936,12 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
     let mut sockets = SocketSet::new(vec![]);
     let mut conns: HashMap<SocketHandle, Conn> = HashMap::new();
     let mut buf = vec![0u8; 16384];
+    // pipe 创建失败时退回原来的 20ms 有界轮询，避免远端数据被延迟 250ms。
+    let poll_cap_ms: u64 = if wake_read.is_some() { POLL_MAX_WAIT_MS } else { 20 };
+    let wake = Wake {
+        write: wake_write,
+        count: tun.wakes.clone(),
+    };
 
     while !tun.stop.load(Ordering::Relaxed) {
         // 1) 取走 Device 攒下的新端口与 UDP 请求
@@ -989,12 +1084,22 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
             let c = client.clone();
             let t = target.clone();
             let ok = connected.clone();
+            let w = wake.clone();
             rt.spawn(async move {
-                match timeout(Duration::from_secs(15), c.tcp_connect(&t)).await {
-                    Ok(Ok(s)) => tcp_relay(s, to_rx, from_tx, ok).await,
-                    Ok(Err(e)) => log::error!("tcp_connect {} failed: {}", t, e),
-                    Err(_) => log::error!("tcp_connect {} timeout", t),
+                let r = timeout(Duration::from_secs(15), c.tcp_connect(&t)).await;
+                match r {
+                    Ok(Ok(s)) => tcp_relay(s, to_rx, from_tx, ok, w.clone()).await,
+                    Ok(Err(e)) => {
+                        log::error!("tcp_connect {} failed: {}", t, e);
+                        drop(from_tx);
+                    }
+                    Err(_) => {
+                        log::error!("tcp_connect {} timeout", t);
+                        drop(from_tx);
+                    }
                 }
+                // connect 失败 / relay 结束都唤醒：主循环据此发 RST / FIN。
+                w.fire();
             });
             log::info!("new tcp conn -> {}", target);
         }
@@ -1085,14 +1190,45 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
         }
         tun.conns.store(conns.len() as u64, Ordering::Relaxed);
 
-        // 6) 最多等 20ms 的 fd 可读，兼作 channel 数据的轮询间隔
+        // 6) 事件驱动等待：同时等 TUN 可读、异步侧唤醒、smoltcp 下一次定时器。
+        //    poll_delay() 给出协议栈自己需要被 poll 的最迟时间（重传 / keep-alive /
+        //    超时），拿它当 poll 超时，定时器就不会因为「睡太久」而卡住；
+        //    上限 poll_cap_ms 兼顾 stop 响应与空闲省电。
+        //    注意 smoltcp 的 Duration::millis() 是取模值，必须用 total_millis()。
+        let wait_ms = match iface.poll_delay(Instant::now(), &sockets) {
+            Some(d) => d.total_millis().min(poll_cap_ms).max(1) as i32,
+            None => poll_cap_ms as i32,
+        };
         unsafe {
-            let mut pfd = libc::pollfd {
-                fd: raw,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, 20);
+            let wake_raw = wake_read.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
+            let mut pfds = [
+                libc::pollfd {
+                    fd: raw,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake_raw,
+                    events: if wake_raw >= 0 { libc::POLLIN } else { 0 },
+                    revents: 0,
+                },
+            ];
+            let nfds: libc::nfds_t = if wake_raw >= 0 { 2 } else { 1 };
+            libc::poll(pfds.as_mut_ptr(), nfds, wait_ms);
+            if wake_raw >= 0 && (pfds[1].revents & libc::POLLIN) != 0 {
+                // 排空非阻塞 pipe：只需知道「有事件」，字节内容无意义。
+                let mut drain = [0u8; 64];
+                loop {
+                    let n = libc::read(
+                        wake_raw,
+                        drain.as_mut_ptr() as *mut libc::c_void,
+                        drain.len(),
+                    );
+                    if n <= 0 {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -1343,6 +1479,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeAttachTun(
         udp_flows: Arc::new(AtomicU64::new(0)),
         ipv6: Arc::new(AtomicU64::new(0)),
         reconnects: Arc::new(AtomicU64::new(0)),
+        wakes: Arc::new(AtomicU64::new(0)),
     };
     let thread_handle = handle.clone();
     let rt_handle = engine.rt.handle().clone();
@@ -1406,7 +1543,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
                         "UDP 会话初始化中"
                     };
                     format!(
-                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {} · 活跃流 {}\nIPv6 封堵 {} 个包 · UDP 流重建 {} 次",
+                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {} · 活跃流 {}\nIPv6 封堵 {} 个包 · UDP 流重建 {} 次 · 主循环唤醒 {} 次",
                         h.packets.load(Ordering::Relaxed),
                         h.bytes.load(Ordering::Relaxed),
                         h.conns.load(Ordering::Relaxed),
@@ -1417,6 +1554,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
                         h.udp_flows.load(Ordering::Relaxed),
                         h.ipv6.load(Ordering::Relaxed),
                         h.reconnects.load(Ordering::Relaxed),
+                        h.wakes.load(Ordering::Relaxed),
                     )
                 }
                 None => "\nTUN：数据面未启动".to_string(),

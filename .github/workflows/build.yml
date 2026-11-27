@@ -15,6 +15,9 @@ jobs:
       HY2BOX_STORE_PASS_B64: aHkyYm94MjAyNg==
       HY2BOX_KEY_PASS_B64: aHkyYm94MjAyNg==
       HY2BOX_KEY_ALIAS: hy2box
+      # 固定证书 SHA-256（去冒号小写），与 keytool 的 BA:AA:08:4D:...:3A:B1 是同一值。
+      # 非机密，用于产物硬校验：指纹不符就让 CI 失败，不让人肉比对日志。
+      HY2BOX_EXPECTED_SHA256: baaa084dbe860ba81332b89395ee406fb32d2405cb6947e49b25197960023ab1
     steps:
       - uses: actions/checkout@v4
 
@@ -94,6 +97,15 @@ jobs:
           echo "HY2BOX_KEY_PASSWORD=$KEYPASS" >> "$GITHUB_ENV"
           echo "HY2BOX_KEY_ALIAS=$HY2BOX_KEY_ALIAS" >> "$GITHUB_ENV"
 
+      # 防止「Decode 成功但 GITHUB_ENV 没传到 Gradle」导致静默回退到临时 debug keystore
+      - name: Assert fixed signing env is active
+        run: |
+          if [ -z "$HY2BOX_KEYSTORE" ] || [ ! -f "$HY2BOX_KEYSTORE" ]; then
+            echo "::error::固定签名环境变量未注入到 Gradle 步骤（HY2BOX_KEYSTORE=$HY2BOX_KEYSTORE）。请确认 Decode 步骤成功、且 workflow 已是 v1.9。"
+            exit 1
+          fi
+          echo "keystore=$HY2BOX_KEYSTORE  alias=$HY2BOX_KEY_ALIAS"
+
       - name: Build APK (fixed signature)
         # 1) 网页上传不会保留 gradlew 的可执行位，用 bash 调用避免 Permission denied
         # 2) 继续用 assembleDebug，但显式指定 selfUse signingConfig；
@@ -101,16 +113,37 @@ jobs:
         # 3) 签名参数已由上一步写入 GITHUB_ENV，这里无需再声明 env
         run: bash ./gradlew assembleDebug --no-daemon --stacktrace
 
-      # 校验产物确实由固定 keystore 签名，而不是回退到了 runner 的临时 debug keystore
+      # 硬断言：指纹不符直接 fail。只打印不比对时，CI 全绿也可能是临时 debug 签名，
+      # 那样每次构建证书都不同，覆盖安装必然提示签名冲突。
       - name: Verify APK signature fingerprint
         run: |
           SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           APKSIGNER=$(find "$SDK_ROOT/build-tools" -type f -name apksigner | sort | tail -n 1)
           echo "apksigner=$APKSIGNER"
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::找不到 apksigner，请看 Inspect preinstalled Android SDK 步骤日志"
+            exit 1
+          fi
+          EXPECTED="$HY2BOX_EXPECTED_SHA256"
+          FAILED=0
           for apk in app/build/outputs/apk/debug/*.apk; do
             echo "== $apk =="
-            "$APKSIGNER" verify --print-certs "$apk"
+            OUT=$("$APKSIGNER" verify --print-certs "$apk" 2>&1 || true)
+            echo "$OUT"
+            GOT=$(printf '%s\n' "$OUT" \
+              | grep -i 'SHA-256 digest' | head -n 1 \
+              | sed 's/^.*digest: *//' | tr -d ' :' | tr 'A-Z' 'a-z' || true)
+            echo "expected=$EXPECTED"
+            echo "actual  =$GOT"
+            if [ "$GOT" != "$EXPECTED" ]; then
+              echo "::error::$apk 不是固定证书签名（很可能回退到 runner 临时 debug keystore），本次 APK 不要拿去覆盖安装"
+              FAILED=1
+            fi
           done
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+          echo "全部 APK 指纹匹配，固定签名已生效"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4

@@ -64,16 +64,50 @@ jobs:
             -o ../app/src/main/jniLibs \
             build --release
 
-      - name: Build APK (signed)
+      # 固定签名：从 Secret 解码 keystore 到 runner 临时目录（不落进仓库、不进 artifact）。
+      # 缺 Secret 时直接 fail，避免悄悄退回随机 debug keystore 而用户以为已固定。
+      - name: Decode fixed signing keystore (self-use only)
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+        run: |
+          if [ -z "$SIGNING_KEYSTORE_BASE64" ]; then
+            echo "::error::缺少 Secret SIGNING_KEYSTORE_BASE64，请在仓库 Settings -> Secrets and variables -> Actions 添加"
+            exit 1
+          fi
+          echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/hy2box.keystore"
+          ls -l "$RUNNER_TEMP/hy2box.keystore"
+          keytool -list -v \
+            -keystore "$RUNNER_TEMP/hy2box.keystore" \
+            -storepass "$SIGNING_STORE_PASSWORD" \
+            -alias "$SIGNING_KEY_ALIAS"
+
+      - name: Build APK (fixed signature)
         # 1) 网页上传不会保留 gradlew 的可执行位，用 bash 调用避免 Permission denied
-        # 2) 用 assembleDebug：release 无 signingConfig 会产出 unsigned APK，
-        #    Android 拒绝安装（一加/ColorOS 提示「安装包异常」）。
-        #    debug 变体由 AGP 自动用 debug keystore 做 v2/v3 签名，可直接安装。
+        # 2) 继续用 assembleDebug，但显式指定 selfUse signingConfig；
+        #    release 变体无签名配置会产出 unsigned APK（ColorOS 提示「安装包异常」）
+        env:
+          HY2BOX_KEYSTORE: ${{ runner.temp }}/hy2box.keystore
+          HY2BOX_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          HY2BOX_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          HY2BOX_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: bash ./gradlew assembleDebug --no-daemon --stacktrace
+
+      # 校验产物确实由固定 keystore 签名，而不是回退到了 runner 的临时 debug keystore
+      - name: Verify APK signature fingerprint
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          APKSIGNER=$(find "$SDK_ROOT/build-tools" -type f -name apksigner | sort | tail -n 1)
+          echo "apksigner=$APKSIGNER"
+          for apk in app/build/outputs/apk/debug/*.apk; do
+            echo "== $apk =="
+            "$APKSIGNER" verify --print-certs "$apk"
+          done
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hy2box-stage1-signed-apk
+          name: hy2box-fixed-signed-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error

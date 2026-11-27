@@ -30,7 +30,27 @@ android {
         }
     }
 
+    // 固定签名（自用侧载反复覆盖安装）：
+    // 仅当 CI / 本地注入 HY2BOX_KEYSTORE 时启用；未注入则保留 AGP 默认 debug 签名，
+    // 保证不配 Secret 也能正常编译。私钥本身绝不提交到仓库。
+    signingConfigs {
+        create("selfUse") {
+            val ks = System.getenv("HY2BOX_KEYSTORE")
+            if (!ks.isNullOrBlank()) {
+                storeFile = file(ks)
+                storePassword = System.getenv("HY2BOX_STORE_PASSWORD") ?: "hy2box2026"
+                keyAlias = System.getenv("HY2BOX_KEY_ALIAS") ?: "hy2box"
+                keyPassword = System.getenv("HY2BOX_KEY_PASSWORD") ?: "hy2box2026"
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (!System.getenv("HY2BOX_KEYSTORE").isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("selfUse")
+            }
+        }
         release {
             isMinifyEnabled = false
         }

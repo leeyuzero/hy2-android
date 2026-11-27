@@ -23,6 +23,9 @@ import androidx.compose.ui.unit.dp
 class MainActivity : ComponentActivity() {
     private lateinit var store: ConfigStore
     private var status by mutableStateOf("未连接")
+    // 分流规则改过但还没重新建立 VPN：applyAppRules() 只在 establish() 读一次。
+    // 提升为类成员，让 vpnLauncher / startVpn 也能重置它。
+    private var ruleDirty by mutableStateOf(false)
     private val handler = Handler(Looper.getMainLooper())
     private var polling = false
 
@@ -49,6 +52,8 @@ class MainActivity : ComponentActivity() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) startVpn()
         else {
+            // 权限被拒 → 新规则没有建立成功，横幅要继续提醒重连
+            ruleDirty = true
             TunnelStatus.connected = false
             TunnelStatus.text = "VPN 权限被拒绝"
             status = TunnelStatus.text
@@ -79,10 +84,12 @@ class MainActivity : ComponentActivity() {
         var showPicker by mutableStateOf(false)
         var appRule by mutableStateOf(store.loadAppRule())
         var manualPkg by mutableStateOf("")
-        // 规则变化立即落盘，不需要用户额外点「保存」
+        // 规则变化立即落盘，不需要用户额外点「保存」；
+        // 同时打上 dirty 标记，横幅会一直提醒「断开 → 连接」直到新规则真正生效。
         val updateRule: (AppRule) -> Unit = { next ->
             appRule = next
             store.saveAppRule(next)
+            ruleDirty = true
         }
 
         setContent {
@@ -219,6 +226,23 @@ class MainActivity : ComponentActivity() {
                             else "展开应用管控 ▼  按 App 分流（${appRule.label()}）"
                         )
                     }
+                    // 折叠状态下也要看见：改完规则不重连，是「选了 Google 却没生效」的最常见原因
+                    if (ruleDirty) {
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                "分流规则已改，但只在建立 VPN 时读取一次。当前连接仍用旧规则 → 请先点「断开」，再点「连接」。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(12.dp),
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                    }
                     if (showAppControl) {
                         Text(
                             "规则在 VPN 建立时生效，改完需「断开 → 连接」。自身 App 永远被排除，" +
@@ -247,6 +271,25 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(6.dp))
                         Button(onClick = { showPicker = true }, modifier = Modifier.fillMaxWidth()) {
                             Text("从已安装应用中选择")
+                        }
+                        // 仅允许模式下只勾 Play 商店必连不上：账号 / 推送 / 下载分别属于别的包
+                        if (appRule.mode == AppMode.WHITELIST) {
+                            Spacer(Modifier.height(6.dp))
+                            Button(
+                                onClick = {
+                                    val next = appRule.packages.toMutableSet()
+                                    next.addAll(GooglePackages.CORE)
+                                    updateRule(appRule.copy(packages = next))
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("一键加入 Google 全家桶（${GooglePackages.CORE.size} 个）")
+                            }
+                            Text(
+                                "仅允许模式必须勾全：商店 + Play 服务 + 服务框架 + 下载器。" +
+                                    "设备未安装的包会被自动跳过，多填无害。",
+                                style = MaterialTheme.typography.labelSmall,
+                            )
                         }
                         Spacer(Modifier.height(6.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -286,8 +329,15 @@ class MainActivity : ComponentActivity() {
                         }
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "Google Play 不稳定时：选「排除模式」并勾选 com.android.vending、" +
-                                "com.google.android.gms，让商店直连、其余仍走隧道。",
+                            "Google 走隧道的正确配置：① 推荐「全局」，所有 App 走隧道，Google 自然在内；" +
+                                "② 或「仅允许模式」点上面的一键加入 Google 全家桶（漏掉 GMS / 服务框架必连不上）。" +
+                                "注意：「排除模式」里勾选 Google = 让它直连，国内网络直连 Google 必然连不上，别这样配。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "判断流量是否真进隧道：打开 Play 时状态卡「DNS 查询」与「TUN IP 包」应持续增长。" +
+                                "若不涨，说明 DNS 被系统解析器漏出（部分 ROM 在仅允许模式下会这样）→ 改回「全局」再断开重连。",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -388,6 +438,8 @@ class MainActivity : ComponentActivity() {
             action = Hy2VpnService.ACTION_CONNECT
         }
         startForegroundService(intent)
+        // 新规则已随本次 establish() 生效，撤掉「需重连」横幅
+        ruleDirty = false
         TunnelStatus.connected = true
         TunnelStatus.text = "正在启动…"
         status = "正在启动…"

@@ -19,6 +19,21 @@ object AppMode {
     }
 }
 
+// 「仅允许模式」下想让 Google 走隧道，缺一不可：
+// 商店只负责界面，账号 / 结算 / 推送注册 / APK 下载分别由 GMS、GSF、下载器完成；
+// 漏掉任何一个，那部分流量就会直连，国内网络直连 Google 必失败。
+// 设备未安装的包在 addAllowedApplication 时会抛 NameNotFoundException，
+// Hy2VpnService.applyAppRules() 已逐个跳过，多填无害。
+object GooglePackages {
+    val CORE = listOf(
+        "com.android.vending",                       // Play 商店
+        "com.google.android.gms",                    // Play 服务：账号 / 结算 / FCM
+        "com.google.android.gsf",                    // Google 服务框架：推送注册
+        "com.android.providers.downloads",           // 系统下载管理器：APK 下载
+        "com.google.android.googlequicksearchbox",   // Google App
+    )
+}
+
 data class AppRule(
     val mode: Int = AppMode.GLOBAL,
     val packages: Set<String> = emptySet(),

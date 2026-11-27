@@ -9,6 +9,12 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 签名口令以 base64 常量内联：私钥本体仍只在 Secret 里，单独拿到口令无意义。
+    # 只维护 1 个 Secret，避免手填 3 个口令漏填 / 带空格 / 值不一致导致 PKCS12 解密失败。
+    env:
+      HY2BOX_STORE_PASS_B64: aHkyYm94MjAyNg==
+      HY2BOX_KEY_PASS_B64: aHkyYm94MjAyNg==
+      HY2BOX_KEY_ALIAS: hy2box
     steps:
       - uses: actions/checkout@v4
 
@@ -64,13 +70,11 @@ jobs:
             -o ../app/src/main/jniLibs \
             build --release
 
-      # 固定签名：从 Secret 解码 keystore 到 runner 临时目录（不落进仓库、不进 artifact）。
+      # 固定签名：只依赖 1 个 Secret（私钥 base64）；口令由 job 级常量解码后写入 GITHUB_ENV。
       # 缺 Secret 时直接 fail，避免悄悄退回随机 debug keystore 而用户以为已固定。
       - name: Decode fixed signing keystore (self-use only)
         env:
           SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
         run: |
           if [ -z "$SIGNING_KEYSTORE_BASE64" ]; then
             echo "::error::缺少 Secret SIGNING_KEYSTORE_BASE64，请在仓库 Settings -> Secrets and variables -> Actions 添加"
@@ -78,20 +82,23 @@ jobs:
           fi
           echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/hy2box.keystore"
           ls -l "$RUNNER_TEMP/hy2box.keystore"
+          STOREPASS=$(printf '%s' "$HY2BOX_STORE_PASS_B64" | base64 -d)
+          KEYPASS=$(printf '%s' "$HY2BOX_KEY_PASS_B64" | base64 -d)
           keytool -list -v \
             -keystore "$RUNNER_TEMP/hy2box.keystore" \
-            -storepass "$SIGNING_STORE_PASSWORD" \
-            -alias "$SIGNING_KEY_ALIAS"
+            -storepass "$STOREPASS" \
+            -alias "$HY2BOX_KEY_ALIAS"
+          # 写入 GITHUB_ENV 后，后续所有步骤（含 Gradle）自动继承这些变量
+          echo "HY2BOX_KEYSTORE=$RUNNER_TEMP/hy2box.keystore" >> "$GITHUB_ENV"
+          echo "HY2BOX_STORE_PASSWORD=$STOREPASS" >> "$GITHUB_ENV"
+          echo "HY2BOX_KEY_PASSWORD=$KEYPASS" >> "$GITHUB_ENV"
+          echo "HY2BOX_KEY_ALIAS=$HY2BOX_KEY_ALIAS" >> "$GITHUB_ENV"
 
       - name: Build APK (fixed signature)
         # 1) 网页上传不会保留 gradlew 的可执行位，用 bash 调用避免 Permission denied
         # 2) 继续用 assembleDebug，但显式指定 selfUse signingConfig；
         #    release 变体无签名配置会产出 unsigned APK（ColorOS 提示「安装包异常」）
-        env:
-          HY2BOX_KEYSTORE: ${{ runner.temp }}/hy2box.keystore
-          HY2BOX_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          HY2BOX_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          HY2BOX_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        # 3) 签名参数已由上一步写入 GITHUB_ENV，这里无需再声明 env
         run: bash ./gradlew assembleDebug --no-daemon --stacktrace
 
       # 校验产物确实由固定 keystore 签名，而不是回退到了 runner 的临时 debug keystore

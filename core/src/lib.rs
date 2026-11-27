@@ -11,7 +11,7 @@ use std::time::{Duration, Instant as StdInstant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, Mutex};
-use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::time::timeout;
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
@@ -28,12 +28,14 @@ const SOCK_BUF: usize = 16384;
 const LISTEN_BACKLOG: usize = 8;
 const MAX_KNOWN_PORTS: usize = 32;
 const PORT_IDLE_TTL_SECS: u64 = 120;
-const UDP_POLL_MS: u64 = 20;
-const FLOW_MAP_MAX: usize = 4096;
-const DNS_TTL_SECS: u64 = 30;
-const UDP_FLOW_TTL_SECS: u64 = 60;
+// P0-4：不再用 20ms 轮询，也不再靠事务 ID 或远端地址反推应答归属。
+const UDP_FLOW_TTL_SECS: u64 = 60;        // 普通 UDP 流空闲回收
+const DNS_FLOW_TTL_SECS: u64 = 10;        // DNS 短事务，更快回收
+const UDP_FLOW_QUEUE: usize = 64;         // 单流待发队列深度
+const MAX_UDP_FLOWS: usize = 256;         // 活跃流上限，超限淘汰最久未见
+const UDP_SESSION_TIMEOUT_SECS: u64 = 10; // 建会话超时
 const TCP_IDLE_TTL_SECS: u64 = 300;
-const GC_INTERVAL_SECS: u64 = 5;
+const GC_INTERVAL_SECS: u64 = 5;          // dispatcher 清理已结束 / 超时的流
 
 #[derive(Clone)]
 struct TunHandle {
@@ -45,8 +47,9 @@ struct TunHandle {
     udp: Arc<AtomicU64>,       // 从 TUN 收到的 UDP 数据报数
     udp_sent: Arc<AtomicU64>,  // 成功交给 UdpSession 发出的数据报数
     udp_ok: Arc<AtomicBool>,   // 服务端是否通告了 UDP 转发能力
+    udp_flows: Arc<AtomicU64>, // 当前活跃的 per-flow UDP 会话数
     ipv6: Arc<AtomicU64>,       // 被封堵（丢弃）的 IPv6 包数
-    reconnects: Arc<AtomicU64>, // UDP 会话重建次数（等价于 QUIC 重连）
+    reconnects: Arc<AtomicU64>, // UDP 会话失效 / 重建次数
 }
 
 struct Engine {
@@ -104,7 +107,8 @@ fn syn_port(buf: &[u8]) -> Option<u16> {
 
 // 一个 UDP 流的两端（以 App 发出的方向记录）。
 // 构造应答时把 src/dst 互换即可，DNS 与普通 UDP 共用。
-#[derive(Clone, Copy)]
+// P0-4：四元组直接作为 per-flow session 的 key，同时用于构造应答。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct LocalEp {
     src_ip: [u8; 4],
     src_port: u16,
@@ -112,11 +116,15 @@ struct LocalEp {
     dst_port: u16,
 }
 
+fn is_dns_ep(ep: LocalEp) -> bool {
+    ep.dst_ip == VIRTUAL_DNS && ep.dst_port == 53
+}
+
 struct UdpReq {
     ep: LocalEp,
     payload: Vec<u8>,
-    target: String,      // 交给 UdpSession 的 "host:port"
-    dns_id: Option<u16>, // DNS 事务 ID，用于把并发应答精确送回原查询端口
+    target: String, // 交给 UdpSession 的 "host:port"
+    is_dns: bool,   // 仅用于降级路径：服务端无 UDP 时 DNS 改走 TCP
 }
 
 // 解析一个完整（未分片）的 IPv4 UDP 包。
@@ -166,12 +174,6 @@ fn parse_udp(buf: &[u8]) -> Option<UdpReq> {
             dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port
         )
     };
-    // DNS 头前 2 字节是事务 ID；UDP DNS 报文没有 TCP 那层长度前缀。
-    let dns_id = if is_dns && payload.len() >= 12 {
-        Some(u16::from_be_bytes([payload[0], payload[1]]))
-    } else {
-        None
-    };
     Some(UdpReq {
         ep: LocalEp {
             src_ip,
@@ -181,7 +183,7 @@ fn parse_udp(buf: &[u8]) -> Option<UdpReq> {
         },
         payload,
         target,
-        dns_id,
+        is_dns,
     })
 }
 
@@ -540,33 +542,100 @@ async fn dns_tcp_worker(
     }
 }
 
-// 把降级期间收到的 DNS 请求继续转给 TCP worker（普通 UDP 只能丢弃）。
-async fn fallback_loop(
+// P0-4：按本地四元组每流一个 UdpSession。UdpSessionManager 按 session_id
+// 把应答分发到各会话独立 channel，单 session 处理所有流必然串包。
+// 每个流一个 task，用 select! 同时等远端应答、本地待发包、空闲超时。
+// session.send() 刻意放在 select! 之外：避免 recv(&mut self) 与 send(&self)
+// 在同一 select! 里的借用争议。recv() 基于 mpsc::Receiver::recv().await，
+// 取消安全，被取消的应答仍留在 channel 里，下一轮一定还会取到。
+
+enum FlowEvent {
+    Reply(Vec<u8>),
+    Out(UdpReq),
+    Failed,
+    Stopped,
+}
+
+async fn flow_task(
+    client: Arc<rsteria2::ReconnectableClient>,
+    fd: Arc<OwnedFd>,
+    lock: Arc<StdMutex<()>>,
     tun: TunHandle,
+    ep: LocalEp,
+    idle_secs: u64,
     mut rx: mpsc::Receiver<UdpReq>,
-    dns_tcp_tx: mpsc::Sender<UdpReq>,
 ) {
+    let mut session = match timeout(
+        Duration::from_secs(UDP_SESSION_TIMEOUT_SECS),
+        client.udp(),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            log::warn!("udp session for local port {} unavailable: {}", ep.src_port, e);
+            tun.reconnects.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Err(_) => {
+            log::warn!("udp session connect timeout");
+            tun.reconnects.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    let idle_dur = Duration::from_secs(idle_secs);
+    let mut idle = tokio::time::sleep(idle_dur);
+    tokio::pin!(idle);
+
     loop {
         if tun.stop.load(Ordering::Relaxed) {
             break;
         }
-        match timeout(Duration::from_millis(200), rx.recv()).await {
-            Ok(Some(req)) => {
-                if req.dns_id.is_some() && dns_tcp_tx.try_send(req).is_err() {
-                    log::warn!("dns fallback queue full, query dropped");
+        let ev = tokio::select! {
+            res = session.recv() => match res {
+                Ok((payload, _src)) => FlowEvent::Reply(payload),
+                Err(_) => FlowEvent::Failed,
+            },
+            item = rx.recv() => match item {
+                Some(req) => FlowEvent::Out(req),
+                None => FlowEvent::Stopped,
+            },
+            _ = &mut idle => FlowEvent::Stopped,
+        };
+        match ev {
+            // 按流隔离后不再需要事务 ID 映射或远端地址流表：
+            // 这个 session 只服务本四元组，应答必然回给 ep 记录的本地端点。
+            FlowEvent::Reply(payload) => {
+                if !tun.stop.load(Ordering::Relaxed) {
+                    write_tun(&fd, &lock, &build_udp_reply(ep, &payload));
                 }
             }
-            Ok(None) => break,
-            Err(_) => {}
+            FlowEvent::Out(req) => match session.send(&req.payload, &req.target) {
+                Ok(()) => {
+                    tun.udp_sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => log::warn!("udp send {} failed: {}", req.target, e),
+            },
+            FlowEvent::Failed => {
+                // QUIC 重连后旧 session 会失效；结束本流，dispatcher 下一包重建。
+                tun.reconnects.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            FlowEvent::Stopped => break,
         }
+        idle.as_mut().reset(tokio::time::Instant::now() + idle_dur);
     }
 }
 
-// 全局 UDP 会话：单个 task 独占 UdpSession（recv 需要 &mut self）。
-// 用「20ms 短等应答 + try_recv 批量发包」的轮询，避开 select! 里
-// recv(&mut) 与 send(&self) 同时借用 session 的冲突，编译期确定安全。
-// 注：P0-4（按本地流每流一个 UdpSession）将在下一批重写这一层。
-async fn udp_worker(
+struct Flow {
+    tx: mpsc::Sender<UdpReq>,
+    last_active: StdInstant,
+    task: tokio::task::JoinHandle<()>,
+}
+
+// 单一 dispatcher 收所有 UDP 包并按四元组分流；不再转移 rx 所有权。
+// 服务端无 UDP 时用标志位降级：DNS 转 TCP worker，普通 UDP 丢弃。
+async fn udp_dispatcher(
     client: Arc<rsteria2::ReconnectableClient>,
     fd: Arc<OwnedFd>,
     lock: Arc<StdMutex<()>>,
@@ -574,123 +643,130 @@ async fn udp_worker(
     mut rx: mpsc::Receiver<UdpReq>,
     dns_tcp_tx: mpsc::Sender<UdpReq>,
 ) {
-    let mut session: Option<rsteria2::UdpSession> = None;
+    // 探测：建一个 session 后立即 drop（UdpSession::Drop 会自动注销 id）。
+    let mut udp_available = false;
     for attempt in 0..3 {
-        match timeout(Duration::from_secs(10), client.udp()).await {
-            Ok(Ok(s)) => {
-                session = Some(s);
+        match timeout(
+            Duration::from_secs(UDP_SESSION_TIMEOUT_SECS),
+            client.udp(),
+        )
+        .await
+        {
+            Ok(Ok(_probe)) => {
+                udp_available = true;
                 break;
             }
-            Ok(Err(e)) => log::warn!("udp session unavailable (try {}): {}", attempt + 1, e),
-            Err(_) => log::warn!("udp session connect timeout (try {})", attempt + 1),
+            Ok(Err(e)) => log::warn!("udp relay unavailable (try {}): {}", attempt + 1, e),
+            Err(_) => log::warn!("udp probe timeout (try {})", attempt + 1),
         }
     }
-    if session.is_none() {
-        tun.udp_ok.store(false, Ordering::Relaxed);
+    tun.udp_ok.store(udp_available, Ordering::Relaxed);
+    if udp_available {
+        log::info!("udp relay ready, per-flow sessions enabled");
+    } else {
         log::warn!("server has no UDP relay -> DNS falls back to TCP, other UDP dropped");
-        fallback_loop(tun.clone(), rx, dns_tcp_tx.clone()).await;
-        return;
     }
-    tun.udp_ok.store(true, Ordering::Relaxed);
-    let mut session = session.unwrap();
-    let mut dns_map: HashMap<u16, (LocalEp, StdInstant)> = HashMap::new();
-    let mut flow_map: HashMap<String, (LocalEp, StdInstant)> = HashMap::new();
-    let mut last_gc = StdInstant::now();
-    log::info!("udp relay session ready");
+
+    let mut flows: HashMap<LocalEp, Flow> = HashMap::new();
+    let gc_dur = Duration::from_secs(GC_INTERVAL_SECS);
+    let mut gc_tick = tokio::time::interval(gc_dur);
 
     loop {
+        tun.udp_flows.store(flows.len() as u64, Ordering::Relaxed);
         if tun.stop.load(Ordering::Relaxed) {
             break;
         }
+        let item = tokio::select! {
+            r = rx.recv() => r,
+            _ = gc_tick.tick() => {
+                let now = StdInstant::now();
+                let ttl = Duration::from_secs(UDP_FLOW_TTL_SECS);
+                let stale: Vec<LocalEp> = flows
+                    .iter()
+                    .filter(|(_, f)| f.task.is_finished() || now.duration_since(f.last_active) > ttl)
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in stale {
+                    if let Some(f) = flows.remove(&k) {
+                        f.task.abort();
+                    }
+                }
+                continue;
+            }
+        };
+        let req = match item {
+            Some(r) => r,
+            None => break,
+        };
 
-        // 0) 每 5 秒清理过期的 DNS 映射与 UDP 流表，避免长时间使用内存只增不减
-        if last_gc.elapsed() >= Duration::from_secs(GC_INTERVAL_SECS) {
-            let now = StdInstant::now();
-            dns_map.retain(|_, (_, t)| {
-                now.duration_since(*t) < Duration::from_secs(DNS_TTL_SECS)
-            });
-            flow_map.retain(|_, (_, t)| {
-                now.duration_since(*t) < Duration::from_secs(UDP_FLOW_TTL_SECS)
-            });
-            last_gc = now;
+        if !udp_available {
+            if req.is_dns && dns_tcp_tx.try_send(req).is_err() {
+                log::warn!("dns fallback queue full, query dropped");
+            }
+            continue;
         }
 
-        // 1) 短等一个远端应答
-        let recv_res = timeout(Duration::from_millis(UDP_POLL_MS), session.recv()).await;
-        match recv_res {
-            Ok(Ok((payload, src))) => {
-                // DNS 应答按事务 ID 精确回给原查询端口，避免并发交错回错端口。
-                let by_dns = if src == DNS_UPSTREAM && payload.len() >= 12 {
-                    let id = u16::from_be_bytes([payload[0], payload[1]]);
-                    dns_map.remove(&id).map(|(ep, _)| ep)
-                } else {
-                    None
-                };
-                let ep = by_dns.or_else(|| flow_map.get(&src).map(|(ep, _)| *ep));
-                if ep.is_some() {
-                    if let Some((_, t)) = flow_map.get_mut(&src) {
-                        *t = StdInstant::now();
-                    }
-                }
-                match ep {
-                    Some(ep) => write_tun(&fd, &lock, &build_udp_reply(ep, &payload)),
-                    None => log::debug!("udp reply without local flow: {}", src),
-                }
-            }
-            Ok(Err(e)) => {
-                // QUIC 重连后旧 session 会失效，重建一个并清空映射表。
-                log::warn!("udp session lost: {} -> rebuilding", e);
-                let mut rebuilt = None;
-                for _ in 0..3 {
-                    match timeout(Duration::from_secs(10), client.udp()).await {
-                        Ok(Ok(s)) => {
-                            rebuilt = Some(s);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                match rebuilt {
-                    Some(s) => {
-                        session = s;
-                        dns_map.clear();
-                        flow_map.clear();
-                        tun.reconnects.fetch_add(1, Ordering::Relaxed);
-                        log::info!("udp session rebuilt");
-                    }
-                    None => {
-                        tun.udp_ok.store(false, Ordering::Relaxed);
-                        log::warn!("udp rebuild failed -> DNS falls back to TCP");
-                        fallback_loop(tun.clone(), rx, dns_tcp_tx.clone()).await;
-                        return;
+        let key = req.ep;
+        if !flows.contains_key(&key) {
+            if flows.len() >= MAX_UDP_FLOWS {
+                let oldest = flows
+                    .iter()
+                    .min_by(|a, b| a.1.last_active.cmp(&b.1.last_active))
+                    .map(|(k, _)| *k);
+                if let Some(k) = oldest {
+                    if let Some(f) = flows.remove(&k) {
+                        f.task.abort();
                     }
                 }
             }
-            Err(_) => {} // 20ms 无应答，正常
+            let (tx, flow_rx) = mpsc::channel::<UdpReq>(UDP_FLOW_QUEUE);
+            let idle_secs = if is_dns_ep(key) {
+                DNS_FLOW_TTL_SECS
+            } else {
+                UDP_FLOW_TTL_SECS
+            };
+            let task = tokio::spawn(flow_task(
+                client.clone(),
+                fd.clone(),
+                lock.clone(),
+                tun.clone(),
+                key,
+                idle_secs,
+                flow_rx,
+            ));
+            flows.insert(
+                key,
+                Flow {
+                    tx,
+                    last_active: StdInstant::now(),
+                    task,
+                },
+            );
         }
 
-        // 2) 批量排空本地待发的 UDP 包
-        while let Ok(req) = rx.try_recv() {
-            if dns_map.len() >= FLOW_MAP_MAX {
-                dns_map.clear();
-            }
-            if flow_map.len() >= FLOW_MAP_MAX {
-                flow_map.clear();
-            }
-            let now = StdInstant::now();
-            if let Some(id) = req.dns_id {
-                dns_map.insert(id, (req.ep, now));
-            }
-            flow_map.insert(req.target.clone(), (req.ep, now));
-            match session.send(&req.payload, &req.target) {
-                Ok(()) => {
-                    tun.udp_sent.fetch_add(1, Ordering::Relaxed);
+        let mut gone = false;
+        if let Some(f) = flows.get_mut(&key) {
+            f.last_active = StdInstant::now();
+            match f.tx.try_send(req) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    log::warn!("udp flow queue full, datagram dropped");
                 }
-                Err(e) => log::warn!("udp send {} failed: {}", req.target, e),
+                Err(_) => gone = true, // Closed 或未来新增变体：会话已结束，下一包重建
+            }
+        }
+        if gone {
+            // flow_task 已结束（session 失效 / 空闲），移除后下一包自动重建
+            if let Some(f) = flows.remove(&key) {
+                f.task.abort();
             }
         }
     }
-    log::info!("udp worker stopped");
+    for (_, f) in flows.drain() {
+        f.task.abort();
+    }
+    tun.udp_flows.store(0, Ordering::Relaxed);
+    log::info!("udp dispatcher stopped");
 }
 
 // ---------- 同步侧：smoltcp 主循环（独占一个 OS 线程） ----------
@@ -726,7 +802,7 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
         let l = write_lock.clone();
         let t = tun.clone();
         rt.spawn(async move {
-            udp_worker(c, f, l, t, udp_rx, dns_tcp_tx).await;
+            udp_dispatcher(c, f, l, t, udp_rx, dns_tcp_tx).await;
         });
     }
     {
@@ -791,7 +867,7 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
                 }
             }
             while let Some(req) = sh.udp_reqs.pop_front() {
-                let is_dns = req.dns_id.is_some();
+                let is_dns = req.is_dns;
                 tun.udp.fetch_add(1, Ordering::Relaxed);
                 if is_dns {
                     tun.dns.fetch_add(1, Ordering::Relaxed);
@@ -1145,6 +1221,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeAttachTun(
         udp: Arc::new(AtomicU64::new(0)),
         udp_sent: Arc::new(AtomicU64::new(0)),
         udp_ok: Arc::new(AtomicBool::new(false)),
+        udp_flows: Arc::new(AtomicU64::new(0)),
         ipv6: Arc::new(AtomicU64::new(0)),
         reconnects: Arc::new(AtomicU64::new(0)),
     };
@@ -1210,7 +1287,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
                         "UDP 会话初始化中"
                     };
                     format!(
-                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {}\nIPv6 封堵 {} 个包 · UDP 会话重建 {} 次",
+                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {} · 活跃流 {}\nIPv6 封堵 {} 个包 · UDP 流重建 {} 次",
                         h.packets.load(Ordering::Relaxed),
                         h.bytes.load(Ordering::Relaxed),
                         h.conns.load(Ordering::Relaxed),
@@ -1218,6 +1295,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
                         udp,
                         h.udp_sent.load(Ordering::Relaxed),
                         mode,
+                        h.udp_flows.load(Ordering::Relaxed),
                         h.ipv6.load(Ordering::Relaxed),
                         h.reconnects.load(Ordering::Relaxed),
                     )

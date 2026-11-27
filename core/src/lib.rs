@@ -44,6 +44,12 @@ const TX_STACK_SIZE: usize = 2048;     // 出站 TCP 包走栈缓冲，常规路
 const UDP_REPLY_CAP: usize = MTU + 64; // 每流一个复用应答缓冲的初始容量
 const POLL_MAX_WAIT_MS: u64 = 250;     // poll 超时上限：兼顾 stop 响应与空闲省电
 
+// ---------- 批次 4-B：AAAA 空应答合成 + DNS TTL 缓存 ----------
+const DNS_TYPE_AAAA: u16 = 28;
+const DNS_CACHE_MAX: usize = 256;      // 缓存条目上限，超限淘汰最久未用
+const DNS_MAX_MIN_TTL: u32 = 300;      // 单条最长缓存 5 分钟，防上游给超大 TTL
+const DNS_PENDING_MAX: usize = 32;     // 单流待配对 DNS 查询上限
+
 #[derive(Clone)]
 struct TunHandle {
     stop: Arc<AtomicBool>,
@@ -58,6 +64,9 @@ struct TunHandle {
     ipv6: Arc<AtomicU64>,       // 被封堵（丢弃）的 IPv6 包数
     reconnects: Arc<AtomicU64>, // UDP 会话失效 / 重建次数
     wakes: Arc<AtomicU64>,      // 异步侧主动唤醒主循环的次数（验收事件驱动生效）
+    dns_aaaa: Arc<AtomicU64>,   // 4-B：本地合成 AAAA 空应答次数
+    dns_hits: Arc<AtomicU64>,   // 4-B：DNS 缓存命中次数
+    dns_cached: Arc<AtomicU64>, // 4-B：当前缓存条目数（GC 时刷新）
 }
 
 struct Engine {
@@ -135,6 +144,8 @@ struct UdpReq {
     payload: Vec<u8>,
     target: String, // 交给 UdpSession 的 "host:port"
     is_dns: bool,   // 仅用于降级路径：服务端无 UDP 时 DNS 改走 TCP
+    dns_key: Option<Vec<u8>>, // 4-B：Some=可合成 / 可缓存的 DNS 查询 key
+    txid: u16,               // 4-B：DNS 事务 ID，用于应答配对与缓存回包
 }
 
 // 解析一个完整（未分片）的 IPv4 UDP 包。
@@ -184,6 +195,18 @@ fn parse_udp(buf: &[u8]) -> Option<UdpReq> {
             dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port
         )
     };
+    // 4-B：只在这里解析一次 DNS question，后续 AAAA 合成 / 缓存命中 /
+    // 应答入缓存都复用 dns_key 与 txid，不再重复解析 wire。
+    let dns_key = if is_dns {
+        parse_dns_question(&payload).map(|(k, _, _, _, _)| k)
+    } else {
+        None
+    };
+    let txid = if is_dns && payload.len() >= 2 {
+        u16::from_be_bytes([payload[0], payload[1]])
+    } else {
+        0
+    };
     Some(UdpReq {
         ep: LocalEp {
             src_ip,
@@ -194,6 +217,8 @@ fn parse_udp(buf: &[u8]) -> Option<UdpReq> {
         payload,
         target,
         is_dns,
+        dns_key,
+        txid,
     })
 }
 
@@ -265,6 +290,272 @@ fn build_udp_reply(ep: LocalEp, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(UDP_REPLY_CAP);
     build_udp_reply_into(&mut out, ep, payload);
     out
+}
+
+// ---------- 批次 4-B：DNS wire 解析、AAAA 空应答、TTL 缓存 ----------
+
+// 解析 DNS 查询的单个 question。返回 (缓存 key, question 结束偏移,
+// qtype, qclass, txid)。多 question / 压缩指针 / 非法报文一律返回 None，
+// 让查询照常走原路径但不可缓存（安全降级）。
+fn parse_dns_question(p: &[u8]) -> Option<(Vec<u8>, usize, u16, u16, u16)> {
+    if p.len() < 12 {
+        return None;
+    }
+    let txid = u16::from_be_bytes([p[0], p[1]]);
+    let flags = u16::from_be_bytes([p[2], p[3]]);
+    if (flags & 0x8000) != 0 {
+        return None; // 不是查询
+    }
+    let qd = u16::from_be_bytes([p[4], p[5]]) as usize;
+    if qd != 1 {
+        return None;
+    }
+    let mut off = 12usize;
+    let mut key: Vec<u8> = Vec::with_capacity(32);
+    loop {
+        if off >= p.len() {
+            return None;
+        }
+        let l = p[off] as usize;
+        if (l & 0xc0) != 0 {
+            return None; // question 里不允许压缩指针
+        }
+        off += 1;
+        if l == 0 {
+            break;
+        }
+        if off + l > p.len() {
+            return None;
+        }
+        key.push(l as u8);
+        for &b in &p[off..off + l] {
+            key.push(b.to_ascii_lowercase());
+        }
+        off += l;
+    }
+    if off + 4 > p.len() {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([p[off], p[off + 1]]);
+    let qclass = u16::from_be_bytes([p[off + 2], p[off + 3]]);
+    key.extend_from_slice(&qtype.to_be_bytes());
+    key.extend_from_slice(&qclass.to_be_bytes());
+    Some((key, off + 4, qtype, qclass, txid))
+}
+
+// key 末尾 4 字节是 qtype(2) + qclass(2)。
+fn dns_key_type(key: &[u8]) -> Option<u16> {
+    if key.len() < 4 {
+        return None;
+    }
+    let n = key.len();
+    Some(u16::from_be_bytes([key[n - 4], key[n - 3]]))
+}
+
+// QTYPE=AAAA 时本地回 NOERROR + 0 answers：IPv6 已被封堵，
+// 让应用立即回落到 IPv4，不必先等 AAAA 超时。
+// 只保留 header + 原 question，丢掉 EDNS OPT 等附加段。
+fn build_aaaa_nodata(p: &[u8]) -> Option<Vec<u8>> {
+    let (_, qend, qtype, _, txid) = parse_dns_question(p)?;
+    if qtype != DNS_TYPE_AAAA || qend > p.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(qend);
+    out.extend_from_slice(&p[..qend]);
+    out[0..2].copy_from_slice(&txid.to_be_bytes());
+    let rd = u16::from_be_bytes([p[2], p[3]]) & 0x0100;
+    let flags = 0x8000u16 | 0x0080u16 | rd; // QR=1, RA=1, 保留 RD, RCODE=0
+    out[2..4].copy_from_slice(&flags.to_be_bytes());
+    out[4..6].copy_from_slice(&1u16.to_be_bytes());  // qdcount=1
+    out[6..8].copy_from_slice(&0u16.to_be_bytes());  // ancount=0
+    out[8..10].copy_from_slice(&0u16.to_be_bytes()); // nscount=0
+    out[10..12].copy_from_slice(&0u16.to_be_bytes()); // arcount=0
+    Some(out)
+}
+
+// 跳过一个 DNS 名称（支持 0xC0xx 压缩指针）。
+fn dns_skip_name(p: &[u8], off: &mut usize) -> bool {
+    loop {
+        if *off >= p.len() {
+            return false;
+        }
+        let l = p[*off];
+        if (l & 0xc0) == 0xc0 {
+            if *off + 2 > p.len() {
+                return false;
+            }
+            *off += 2;
+            return true;
+        }
+        *off += 1;
+        if l == 0 {
+            return true;
+        }
+        *off += l as usize;
+        if *off > p.len() {
+            return false;
+        }
+    }
+}
+
+// 扫描应答的 answer / authority 段，收集 TTL 字段偏移与最小 TTL。
+// 只接受 NOERROR / 有 answer / 未截断的应答；additional 段（含 EDNS OPT）
+// 原样保留、不参与 TTL 递减 —— OPT 的 TTL 位置其实是 DO 位等标志，
+// 当普通 TTL 递减会破坏 EDNS 语义。
+fn dns_scan_rrs(p: &[u8]) -> Option<(Vec<usize>, u32)> {
+    if p.len() < 12 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([p[2], p[3]]);
+    if (flags & 0x8000) == 0 || (flags & 0x000f) != 0 || (flags & 0x0200) != 0 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([p[4], p[5]]) as usize;
+    let an = u16::from_be_bytes([p[6], p[7]]) as usize;
+    let ns = u16::from_be_bytes([p[8], p[9]]) as usize;
+    if an == 0 {
+        return None;
+    }
+    let mut off = 12usize;
+    for _ in 0..qd {
+        if !dns_skip_name(p, &mut off) || off + 4 > p.len() {
+            return None;
+        }
+        off += 4;
+    }
+    let mut offsets = Vec::with_capacity(an + ns);
+    let mut min_ttl = u32::MAX;
+    for _ in 0..(an + ns) {
+        if !dns_skip_name(p, &mut off) || off + 10 > p.len() {
+            return None;
+        }
+        let ttl_off = off + 4; // NAME + TYPE(2) + CLASS(2)
+        let ttl = u32::from_be_bytes([
+            p[ttl_off],
+            p[ttl_off + 1],
+            p[ttl_off + 2],
+            p[ttl_off + 3],
+        ]);
+        let rdlen = u16::from_be_bytes([p[off + 8], p[off + 9]]) as usize;
+        off += 10 + rdlen;
+        if off > p.len() {
+            return None;
+        }
+        offsets.push(ttl_off);
+        if ttl < min_ttl {
+            min_ttl = ttl;
+        }
+    }
+    if min_ttl == u32::MAX || min_ttl == 0 {
+        return None;
+    }
+    Some((offsets, min_ttl.min(DNS_MAX_MIN_TTL)))
+}
+
+struct DnsCacheEntry {
+    resp: Vec<u8>,
+    ttl_offsets: Vec<usize>,
+    min_ttl: u32,
+    inserted: StdInstant,
+    last_used: StdInstant,
+}
+
+struct DnsCache {
+    map: HashMap<Vec<u8>, DnsCacheEntry>,
+}
+
+fn dns_cache_new() -> Arc<StdMutex<DnsCache>> {
+    Arc::new(StdMutex::new(DnsCache {
+        map: HashMap::new(),
+    }))
+}
+
+fn dns_cache_insert(cache: &Arc<StdMutex<DnsCache>>, key: &[u8], resp: &[u8]) {
+    let (offsets, min_ttl) = match dns_scan_rrs(resp) {
+        Some(v) => v,
+        None => return,
+    };
+    let now = StdInstant::now();
+    let mut c = match cache.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if c.map.len() >= DNS_CACHE_MAX && !c.map.contains_key(key) {
+        let oldest = c
+            .map
+            .iter()
+            .min_by(|a, b| a.1.last_used.cmp(&b.1.last_used))
+            .map(|(k, _)| k.clone());
+        if let Some(k) = oldest {
+            c.map.remove(&k);
+        }
+    }
+    c.map.insert(
+        key.to_vec(),
+        DnsCacheEntry {
+            resp: resp.to_vec(),
+            ttl_offsets: offsets,
+            min_ttl,
+            inserted: now,
+            last_used: now,
+        },
+    );
+}
+
+fn dns_cache_hit(cache: &Arc<StdMutex<DnsCache>>, key: &[u8], query: &[u8]) -> Option<Vec<u8>> {
+    let (_, qend, _, _, txid) = parse_dns_question(query)?;
+    let now = StdInstant::now();
+    let mut c = match cache.lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    let expired = match c.map.get(key) {
+        Some(e) => now.duration_since(e.inserted).as_secs() >= e.min_ttl as u64,
+        None => return None,
+    };
+    if expired {
+        c.map.remove(key);
+        return None;
+    }
+    let out = {
+        let e = match c.map.get_mut(key) {
+            Some(e) => e,
+            None => return None,
+        };
+        e.last_used = now;
+        let elapsed = now.duration_since(e.inserted).as_secs() as u32;
+        let mut o = e.resp.clone();
+        if o.len() < 12 {
+            return None;
+        }
+        o[0..2].copy_from_slice(&txid.to_be_bytes());
+        // 4-B：用当前查询的 question 原样覆盖，兼容 DNS 0x20 大小写校验。
+        // key 含规范化 qname，同一 key 的 question 长度必然一致，
+        // 缓存应答里 0xC00C 这类压缩指针仍指向 offset 12 的 question。
+        if qend <= query.len() && qend <= o.len() {
+            o[12..qend].copy_from_slice(&query[12..qend]);
+        }
+        for &t in &e.ttl_offsets {
+            if t + 4 > o.len() {
+                continue;
+            }
+            let v = u32::from_be_bytes([o[t], o[t + 1], o[t + 2], o[t + 3]]);
+            o[t..t + 4].copy_from_slice(&v.saturating_sub(elapsed).to_be_bytes());
+        }
+        o
+    };
+    Some(out)
+}
+
+fn dns_cache_gc(cache: &Arc<StdMutex<DnsCache>>) -> usize {
+    let mut c = match cache.lock() {
+        Ok(g) => g,
+        Err(_) => return 0,
+    };
+    let now = StdInstant::now();
+    c.map
+        .retain(|_, e| now.duration_since(e.inserted).as_secs() < e.min_ttl as u64);
+    c.map.len()
 }
 
 // TUN fd 由 Arc<OwnedFd> 共享所有权：最后一个引用 drop 时才 close，
@@ -544,6 +835,7 @@ async fn dns_tcp_query(
     fd: Arc<OwnedFd>,
     lock: Arc<StdMutex<()>>,
     stop: Arc<AtomicBool>,
+    cache: Arc<StdMutex<DnsCache>>,
 ) {
     let mut s = match timeout(Duration::from_secs(10), client.tcp_connect(DNS_UPSTREAM)).await {
         Ok(Ok(s)) => s,
@@ -580,6 +872,10 @@ async fn dns_tcp_query(
     if stop.load(Ordering::Relaxed) {
         return;
     }
+    // 4-B：降级 TCP 路径的应答同样入缓存（与 UDP 路径共用一份缓存）。
+    if let Some(k) = req.dns_key.as_deref() {
+        dns_cache_insert(&cache, k, &resp);
+    }
     write_tun(&fd, &lock, &build_udp_reply(req.ep, &resp));
 }
 
@@ -589,14 +885,16 @@ async fn dns_tcp_worker(
     lock: Arc<StdMutex<()>>,
     stop: Arc<AtomicBool>,
     mut rx: mpsc::Receiver<UdpReq>,
+    cache: Arc<StdMutex<DnsCache>>,
 ) {
     while let Some(req) = rx.recv().await {
         let c = client.clone();
         let f = fd.clone();
         let l = lock.clone();
         let s = stop.clone();
+        let dc = cache.clone();
         tokio::spawn(async move {
-            dns_tcp_query(c, req, f, l, s).await;
+            dns_tcp_query(c, req, f, l, s, dc).await;
         });
     }
 }
@@ -623,6 +921,7 @@ async fn flow_task(
     ep: LocalEp,
     idle_secs: u64,
     mut rx: mpsc::Receiver<UdpReq>,
+    cache: Arc<StdMutex<DnsCache>>,
 ) {
     let mut session = match timeout(
         Duration::from_secs(UDP_SESSION_TIMEOUT_SECS),
@@ -647,6 +946,8 @@ async fn flow_task(
     tokio::pin!(idle);
     // 本流复用同一个应答缓冲：DNS / UDP 密集回包时不再每个包分配 Vec。
     let mut reply: Vec<u8> = Vec::with_capacity(UDP_REPLY_CAP);
+    // 4-B：DNS 查询与应答按事务 ID 配对，配对成功后把应答写入缓存。
+    let mut pending: VecDeque<(u16, Option<Vec<u8>>)> = VecDeque::new();
 
     loop {
         if tun.stop.load(Ordering::Relaxed) {
@@ -667,17 +968,35 @@ async fn flow_task(
             // 按流隔离后不再需要事务 ID 映射或远端地址流表：
             // 这个 session 只服务本四元组，应答必然回给 ep 记录的本地端点。
             FlowEvent::Reply(payload) => {
+                if is_dns_ep(ep) && payload.len() >= 2 {
+                    let txid = u16::from_be_bytes([payload[0], payload[1]]);
+                    if let Some(pos) = pending.iter().position(|(t, _)| *t == txid) {
+                        if let Some((_, key)) = pending.remove(pos) {
+                            if let Some(k) = key {
+                                dns_cache_insert(&cache, &k, &payload);
+                            }
+                        }
+                    }
+                }
                 if !tun.stop.load(Ordering::Relaxed) {
                     build_udp_reply_into(&mut reply, ep, &payload);
                     write_tun(&fd, &lock, &reply);
                 }
             }
-            FlowEvent::Out(req) => match session.send(&req.payload, &req.target) {
-                Ok(()) => {
-                    tun.udp_sent.fetch_add(1, Ordering::Relaxed);
+            FlowEvent::Out(req) => {
+                if is_dns_ep(ep) {
+                    if pending.len() >= DNS_PENDING_MAX {
+                        pending.pop_front();
+                    }
+                    pending.push_back((req.txid, req.dns_key.clone()));
                 }
-                Err(e) => log::warn!("udp send {} failed: {}", req.target, e),
-            },
+                match session.send(&req.payload, &req.target) {
+                    Ok(()) => {
+                        tun.udp_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => log::warn!("udp send {} failed: {}", req.target, e),
+                }
+            }
             FlowEvent::Failed => {
                 // QUIC 重连后旧 session 会失效；结束本流，dispatcher 下一包重建。
                 tun.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -704,6 +1023,7 @@ async fn udp_dispatcher(
     tun: TunHandle,
     mut rx: mpsc::Receiver<UdpReq>,
     dns_tcp_tx: mpsc::Sender<UdpReq>,
+    cache: Arc<StdMutex<DnsCache>>,
 ) {
     // 探测：建一个 session 后立即 drop（UdpSession::Drop 会自动注销 id）。
     let mut udp_available = false;
@@ -741,6 +1061,8 @@ async fn udp_dispatcher(
         let item = tokio::select! {
             r = rx.recv() => r,
             _ = gc_tick.tick() => {
+                tun.dns_cached
+                    .store(dns_cache_gc(&cache) as u64, Ordering::Relaxed);
                 let now = StdInstant::now();
                 let ttl = Duration::from_secs(UDP_FLOW_TTL_SECS);
                 let stale: Vec<LocalEp> = flows
@@ -760,6 +1082,24 @@ async fn udp_dispatcher(
             Some(r) => r,
             None => break,
         };
+
+        // 4-B：DNS 本地处理在 dispatcher 入口统一拦截，UDP 会话与降级
+        // DNS over TCP 两条路径都会先经过这里。
+        if req.is_dns {
+            if let Some(key) = req.dns_key.as_deref() {
+                if dns_key_type(key) == Some(DNS_TYPE_AAAA) {
+                    if let Some(resp) = build_aaaa_nodata(&req.payload) {
+                        tun.dns_aaaa.fetch_add(1, Ordering::Relaxed);
+                        write_tun(&fd, &lock, &build_udp_reply(req.ep, &resp));
+                        continue;
+                    }
+                } else if let Some(resp) = dns_cache_hit(&cache, key, &req.payload) {
+                    tun.dns_hits.fetch_add(1, Ordering::Relaxed);
+                    write_tun(&fd, &lock, &build_udp_reply(req.ep, &resp));
+                    continue;
+                }
+            }
+        }
 
         if !udp_available {
             if req.is_dns && dns_tcp_tx.try_send(req).is_err() {
@@ -795,6 +1135,7 @@ async fn udp_dispatcher(
                 key,
                 idle_secs,
                 flow_rx,
+                cache.clone(),
             ));
             flows.insert(
                 key,
@@ -886,14 +1227,17 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
     }));
     let (udp_tx, udp_rx) = mpsc::channel::<UdpReq>(256);
     let (dns_tcp_tx, dns_tcp_rx) = mpsc::channel::<UdpReq>(64);
+    // 4-B：UDP 会话与降级 TCP 共用同一份 DNS 缓存。
+    let dns_cache = dns_cache_new();
 
     {
         let c = client.clone();
         let f = fd.clone();
         let l = write_lock.clone();
         let t = tun.clone();
+        let dc = dns_cache.clone();
         rt.spawn(async move {
-            udp_dispatcher(c, f, l, t, udp_rx, dns_tcp_tx).await;
+            udp_dispatcher(c, f, l, t, udp_rx, dns_tcp_tx, dc).await;
         });
     }
     {
@@ -901,8 +1245,9 @@ fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: H
         let f = fd.clone();
         let l = write_lock.clone();
         let s = tun.stop.clone();
+        let dc = dns_cache.clone();
         rt.spawn(async move {
-            dns_tcp_worker(c, f, l, s, dns_tcp_rx).await;
+            dns_tcp_worker(c, f, l, s, dns_tcp_rx, dc).await;
         });
     }
 
@@ -1480,6 +1825,9 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeAttachTun(
         ipv6: Arc::new(AtomicU64::new(0)),
         reconnects: Arc::new(AtomicU64::new(0)),
         wakes: Arc::new(AtomicU64::new(0)),
+        dns_aaaa: Arc::new(AtomicU64::new(0)),
+        dns_hits: Arc::new(AtomicU64::new(0)),
+        dns_cached: Arc::new(AtomicU64::new(0)),
     };
     let thread_handle = handle.clone();
     let rt_handle = engine.rt.handle().clone();
@@ -1543,7 +1891,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
                         "UDP 会话初始化中"
                     };
                     format!(
-                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {} · 活跃流 {}\nIPv6 封堵 {} 个包 · UDP 流重建 {} 次 · 主循环唤醒 {} 次",
+                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {} · 活跃流 {}\nIPv6 封堵 {} 个包 · UDP 流重建 {} 次 · 主循环唤醒 {} 次\nAAAA 空应答 {} 次 · DNS 缓存命中 {} 次 / 条目 {}",
                         h.packets.load(Ordering::Relaxed),
                         h.bytes.load(Ordering::Relaxed),
                         h.conns.load(Ordering::Relaxed),
@@ -1555,6 +1903,9 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
                         h.ipv6.load(Ordering::Relaxed),
                         h.reconnects.load(Ordering::Relaxed),
                         h.wakes.load(Ordering::Relaxed),
+                        h.dns_aaaa.load(Ordering::Relaxed),
+                        h.dns_hits.load(Ordering::Relaxed),
+                        h.dns_cached.load(Ordering::Relaxed),
                     )
                 }
                 None => "\nTUN：数据面未启动".to_string(),

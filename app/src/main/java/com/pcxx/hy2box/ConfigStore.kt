@@ -3,7 +3,37 @@ package com.pcxx.hy2box
 import android.content.Context
 import org.json.JSONObject
 
+// ===== 应用管控 / 按 App 分流 =====
+// 这些规则只作用于 Android VpnService.Builder（addAllowedApplication /
+// addDisallowedApplication），**不进 JNI JSON、不传给 Rust 内核**，数据面零改动。
+// 规则只在 establish() 时读一次，改完必须断开重连才生效。
+object AppMode {
+    const val GLOBAL = 0      // 全部走隧道（仅自身排除）
+    const val BLACKLIST = 1   // 勾选的应用直连，其余走隧道
+    const val WHITELIST = 2   // 仅勾选的应用走隧道，其余直连
+
+    fun label(m: Int): String = when (m) {
+        BLACKLIST -> "排除模式（勾选直连）"
+        WHITELIST -> "仅允许模式（勾选走隧道）"
+        else -> "全局"
+    }
+}
+
+data class AppRule(
+    val mode: Int = AppMode.GLOBAL,
+    val packages: Set<String> = emptySet(),
+) {
+    fun label(): String = when (mode) {
+        AppMode.BLACKLIST -> "排除 ${packages.size} 个应用"
+        AppMode.WHITELIST ->
+            if (packages.isEmpty()) "仅允许模式（空，回退全局）"
+            else "仅允许 ${packages.size} 个应用"
+        else -> "全局"
+    }
+}
+
 // 与 Rust 侧 UiConfig 的字段一一对应；toJson() 是 JNI 唯一的传参入口。
+// 应用管控规则刻意独立存放，不塞进这里，避免改变 JNI JSON 契约。
 data class Hy2Config(
     val server: String = "",
     val auth: String = "",
@@ -84,5 +114,29 @@ class ConfigStore(ctx: Context) {
             .putBoolean("fastOpen", c.fastOpen)
             .putString("pinSha256", c.pinSha256)
             .apply()
+    }
+
+    // ===== 应用管控规则（独立于 Hy2Config / JNI JSON）=====
+    // 旧版本没有这两个 key → 回落到「全局 + 空集合」，行为与升级前完全一致。
+    fun loadAppRule(): AppRule {
+        val rawMode = sp.getInt(KEY_APP_MODE, AppMode.GLOBAL)
+        val mode = if (rawMode in AppMode.GLOBAL..AppMode.WHITELIST) rawMode else AppMode.GLOBAL
+        val packages = sp.getStringSet(KEY_APP_PACKAGES, emptySet())
+            ?.filter { it.isNotBlank() }
+            ?.toSet() ?: emptySet()
+        return AppRule(mode, packages)
+    }
+
+    fun saveAppRule(r: AppRule) {
+        sp.edit()
+            .putInt(KEY_APP_MODE, r.mode)
+            // getStringSet 返回的集合不可原地修改，这里每次都换成新 Set
+            .putStringSet(KEY_APP_PACKAGES, r.packages.filter { it.isNotBlank() }.toSet())
+            .apply()
+    }
+
+    private companion object {
+        const val KEY_APP_MODE = "appMode"
+        const val KEY_APP_PACKAGES = "appPackages"
     }
 }

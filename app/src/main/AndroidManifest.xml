@@ -5,6 +5,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 应用管控：API 30+ 默认只能看到自身与少量系统包，枚举已安装应用需要此权限。
+         本 App 仅自己侧载自用、不上架，使用 QUERY_ALL_PACKAGES 无商店政策顾虑。 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <!-- 双保险：即使某些 ROM 收窄 QUERY_ALL_PACKAGES，也至少能列出有启动图标的应用 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="false"

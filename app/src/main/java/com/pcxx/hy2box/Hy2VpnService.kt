@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -72,7 +73,7 @@ class Hy2VpnService : VpnService() {
         // Stage 2 · Step 4：
         // - 全局路由 0.0.0.0/0 + ::/0，把 IPv6 也劫持进 TUN（Rust 侧丢弃，防止绕隧道泄漏）
         // - 虚拟 DNS 10.0.0.1:53 与全局 UDP 经 hy2 UdpSession 转发
-        // - 必须排除自身，否则 hy2 的 QUIC 流量也被劫持进 TUN 造成回环死锁
+        // - 应用管控：buildVpnBuilder 内按 AppRule 应用 addAllowed / addDisallowed
         var pfd = buildVpnBuilder(true).establish()
         if (pfd == null) {
             // 少数 ROM 不接受 IPv6 地址/路由，退回纯 IPv4，保证 VPN 仍能建立
@@ -99,6 +100,8 @@ class Hy2VpnService : VpnService() {
         TunnelStatus.connected = true
         handler.removeCallbacks(statusPoll)
         handler.post(statusPoll)
+        // 用当前生效的分流模式刷新通知，真机下拉通知栏即可确认规则
+        startForeground(1, buildNotification())
     }
 
     private fun buildVpnBuilder(includeIpv6: Boolean): Builder {
@@ -116,12 +119,54 @@ class Hy2VpnService : VpnService() {
                 android.util.Log.w("hy2box", "IPv6 address/route unavailable", e)
             }
         }
-        try {
-            b.addDisallowedApplication(packageName)
-        } catch (e: Exception) {
-            android.util.Log.w("hy2box", "addDisallowedApplication failed", e)
-        }
+        applyAppRules(b)
         return b
+    }
+
+    // Android 规定 addAllowedApplication 与 addDisallowedApplication 互斥：
+    // 同一个 Builder 只能用其中一种。规则只在 establish() 时读一次 → 改配置必须断开重连。
+    private fun applyAppRules(b: Builder) {
+        val rule = ConfigStore(this).loadAppRule()
+        when (rule.mode) {
+            AppMode.WHITELIST -> {
+                // 白名单模式：自身不在 allowed 列表内 → 天然直连，不会 QUIC 回环
+                val targets = rule.packages.filter { it.isNotBlank() && it != packageName }
+                var applied = 0
+                for (pkg in targets) if (addAllowed(b, pkg)) applied++
+                if (applied == 0) {
+                    // 白名单为空 / 包名全部已卸载 → 回退全局，避免建了 VPN 却没有任何流量
+                    android.util.Log.w("hy2box", "whitelist empty or invalid, fallback to global")
+                    addDisallowed(b, packageName)
+                }
+            }
+            AppMode.BLACKLIST -> {
+                // 自身必须排除，否则 hy2 的 QUIC 流量被劫持进 TUN 造成回环死锁
+                addDisallowed(b, packageName)
+                for (pkg in rule.packages) {
+                    if (pkg.isBlank() || pkg == packageName) continue
+                    addDisallowed(b, pkg)
+                }
+            }
+            else -> addDisallowed(b, packageName)
+        }
+    }
+
+    // 用户可能已卸载某个曾勾选的包，逐个捕获 NameNotFoundException 跳过，
+    // 不能让一个失效包名导致整个 establish() 失败。
+    private fun addAllowed(b: Builder, pkg: String): Boolean = try {
+        b.addAllowedApplication(pkg)
+        true
+    } catch (e: PackageManager.NameNotFoundException) {
+        android.util.Log.w("hy2box", "addAllowedApplication miss: $pkg")
+        false
+    }
+
+    private fun addDisallowed(b: Builder, pkg: String): Boolean = try {
+        b.addDisallowedApplication(pkg)
+        true
+    } catch (e: PackageManager.NameNotFoundException) {
+        android.util.Log.w("hy2box", "addDisallowedApplication miss: $pkg")
+        false
     }
 
     // 幂等：onStartCommand(ACTION_DISCONNECT) 与 onDestroy 可能都会走到这里。
@@ -173,7 +218,7 @@ class Hy2VpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val text = "配置项版：TCP + UDP 全局经 hy2 隧道（IPv6 已封堵）"
+        val text = "配置项版 · TCP+UDP 经 hy2 隧道 · 分流：${ConfigStore(this).loadAppRule().label()}"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("hy2box")

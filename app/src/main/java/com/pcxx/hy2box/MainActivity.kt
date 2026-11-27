@@ -19,6 +19,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private lateinit var store: ConfigStore
@@ -74,18 +76,37 @@ class MainActivity : ComponentActivity() {
         var showAdvanced by mutableStateOf(false)
         var configSummary by mutableStateOf(cfg.summary())
 
+        // ===== 应用管控状态 =====
+        var showAppControl by mutableStateOf(false)
+        var showPicker by mutableStateOf(false)
+        var appRule by mutableStateOf(store.loadAppRule())
+        var manualPkg by mutableStateOf("")
+        var installedApps by mutableStateOf(emptyList<AppInfo>())
+        // 规则变化立即落盘，不需要用户额外点「保存」
+        val updateRule: (AppRule) -> Unit = { next ->
+            appRule = next
+            store.saveAppRule(next)
+        }
+
         setContent {
+            // 枚举已安装应用放到 IO 线程，避免阻塞首帧
+            LaunchedEffect(Unit) {
+                installedApps = withContext(Dispatchers.IO) {
+                    loadInstalledApps(this@MainActivity)
+                }
+            }
             MaterialTheme {
                 Column(
                     Modifier
                         .padding(20.dp)
                         .verticalScroll(rememberScrollState())
                 ) {
-                    Text("hy2box · 配置项版", style = MaterialTheme.typography.titleLarge)
+                    Text("hy2box · 配置项 + 应用管控版", style = MaterialTheme.typography.titleLarge)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "基础三项 + 展开「高级设置」可配置 insecure / 带宽 / obfs / 端口跳跃 / 证书 Pin。" +
-                            "所有配置以 JSON 传给 Rust 内核，状态卡会回显实际生效值。",
+                        "基础三项 + 展开「高级设置」可配置 insecure / 带宽 / obfs / 端口跳跃 / 证书 Pin；" +
+                            "展开「应用管控」可按 App 分流。节点配置以 JSON 传给 Rust 内核；" +
+                            "分流规则只作用于 Android VpnService，不传给内核。",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(Modifier.height(16.dp))
@@ -196,6 +217,84 @@ class MainActivity : ComponentActivity() {
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
+
+                    // ===== 应用管控 / 按 App 分流 =====
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(onClick = { showAppControl = !showAppControl }) {
+                        Text(
+                            if (showAppControl) "收起应用管控 ▲"
+                            else "展开应用管控 ▼  按 App 分流（${appRule.label()}）"
+                        )
+                    }
+                    if (showAppControl) {
+                        Text(
+                            "规则在 VPN 建立时生效，改完需「断开 → 连接」。自身 App 永远被排除，" +
+                                "避免 hy2 的 QUIC 流量被劫持进 TUN 造成回环。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        listOf(
+                            AppMode.GLOBAL to "全局：所有应用走隧道（默认）",
+                            AppMode.BLACKLIST to "排除模式：勾选的应用直连，其余走隧道",
+                            AppMode.WHITELIST to "仅允许模式：仅勾选的应用走隧道，其余直连",
+                        ).forEach { (m, label) ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(
+                                    selected = appRule.mode == m,
+                                    onClick = { updateRule(appRule.copy(mode = m)) },
+                                )
+                                Text(label, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "已勾选 ${appRule.packages.size} 个应用 · 当前：${appRule.label()}",
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Button(onClick = { showPicker = true }, modifier = Modifier.fillMaxWidth()) {
+                            Text("从已安装应用中选择")
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(
+                                value = manualPkg,
+                                onValueChange = { manualPkg = it },
+                                label = { Text("手动添加包名，如 com.android.vending") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Button(onClick = {
+                                val p = manualPkg.trim()
+                                if (p.isNotBlank()) {
+                                    updateRule(appRule.copy(packages = appRule.packages + p))
+                                    manualPkg = ""
+                                }
+                            }) { Text("添加") }
+                        }
+                        if (appRule.packages.isNotEmpty()) {
+                            Spacer(Modifier.height(6.dp))
+                            Text("点击可移除：", style = MaterialTheme.typography.labelSmall)
+                            // 外层已是可滚动 Column，这里用普通 Column，不能嵌套 LazyColumn
+                            Column {
+                                appRule.packages.sorted().forEach { pkg ->
+                                    TextButton(onClick = {
+                                        updateRule(appRule.copy(packages = appRule.packages - pkg))
+                                    }) {
+                                        Text("✕ $pkg", style = MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Google Play 不稳定时：选「排除模式」并勾选 com.android.vending、" +
+                                "com.google.android.gms，让商店直连、其余仍走隧道。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+
                     Spacer(Modifier.height(12.dp))
                     Button(onClick = {
                         val current = Hy2Config(
@@ -213,6 +312,7 @@ class MainActivity : ComponentActivity() {
                             pinSha256 = pinInput,
                         )
                         store.save(current)
+                        store.saveAppRule(appRule)
                         configSummary = current.summary()
                         TunnelStatus.connected = true
                         TunnelStatus.text = "正在启动…"
@@ -221,7 +321,7 @@ class MainActivity : ComponentActivity() {
                         val intent = VpnService.prepare(this@MainActivity)
                         if (intent != null) vpnLauncher.launch(intent) else startVpn()
                     }, modifier = Modifier.fillMaxWidth()) {
-                        Text("连接（全局上网）")
+                        Text("连接（${appRule.label()}）")
                     }
                     Spacer(Modifier.height(8.dp))
                     Button(onClick = {
@@ -256,9 +356,19 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(12.dp))
                     Text(
                         "验收：状态卡「配置：…」一行应与界面填写一致；改 insecure / 带宽 / obfs 后重连能握手成功即生效。" +
+                            "改分流模式或勾选应用后必须断开重连，通知栏会显示当前分流模式。" +
                             "断开后状态停在「已断开」；DNS 计数为 0 时先关系统「私人 DNS」。",
                         style = MaterialTheme.typography.bodySmall
                     )
+
+                    if (showPicker) {
+                        AppPickerDialog(
+                            all = installedApps,
+                            selected = appRule.packages,
+                            onConfirm = { sel -> updateRule(appRule.copy(packages = sel)) },
+                            onDismiss = { showPicker = false },
+                        )
+                    }
                 }
             }
         }

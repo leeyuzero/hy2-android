@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, Mutex};
@@ -25,6 +25,10 @@ const MTU: usize = 1500;
 const SOCK_BUF: usize = 32768;
 const UDP_POLL_MS: u64 = 20;
 const FLOW_MAP_MAX: usize = 4096;
+const DNS_TTL_SECS: u64 = 30;
+const UDP_FLOW_TTL_SECS: u64 = 60;
+const TCP_IDLE_TTL_SECS: u64 = 300;
+const GC_INTERVAL_SECS: u64 = 5;
 
 #[derive(Clone)]
 struct TunHandle {
@@ -36,6 +40,8 @@ struct TunHandle {
     udp: Arc<AtomicU64>,       // 从 TUN 收到的 UDP 数据报数
     udp_sent: Arc<AtomicU64>,  // 成功交给 UdpSession 发出的数据报数
     udp_ok: Arc<AtomicBool>,   // 服务端是否通告了 UDP 转发能力
+    ipv6: Arc<AtomicU64>,       // 被封堵（丢弃）的 IPv6 包数
+    reconnects: Arc<AtomicU64>, // UDP 会话重建次数（等价于 QUIC 重连）
 }
 
 struct Engine {
@@ -251,6 +257,7 @@ struct TunDevice {
     shared: Rc<RefCell<Shared>>,
     packets: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
+    ipv6: Arc<AtomicU64>,
     write_lock: Arc<StdMutex<()>>,
 }
 
@@ -316,6 +323,13 @@ impl Device for TunDevice {
         self.packets.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(n as u64, Ordering::Relaxed);
 
+        // Step 4：全局路由已加 ::/0，IPv6 全部进 TUN 后在此直接丢弃，
+        // 避免它走物理网卡绕隧道泄漏。不交给 smoltcp（只启用 proto-ipv4），也不回 ICMPv6。
+        if buf.len() >= 20 && buf[0] >> 4 == 6 {
+            self.ipv6.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
         // 所有 IPv4 UDP 包都不进 smoltcp：可转发的交给 worker，其余直接丢弃。
         // 不交给协议栈可避免 any_ip 下回 ICMP port unreachable 让 App 误判连接失败。
         if buf.len() >= 20 && buf[0] >> 4 == 4 && buf[9] == 17 {
@@ -359,6 +373,7 @@ struct Conn {
     to_remote: mpsc::Sender<Vec<u8>>,
     from_remote: mpsc::Receiver<Vec<u8>>,
     pending: Vec<u8>,
+    last_active: StdInstant,
 }
 
 async fn tcp_relay(
@@ -494,13 +509,26 @@ async fn udp_worker(
     }
     tun.udp_ok.store(true, Ordering::Relaxed);
     let mut session = session.unwrap();
-    let mut dns_map: HashMap<u16, LocalEp> = HashMap::new();
-    let mut flow_map: HashMap<String, LocalEp> = HashMap::new();
+    let mut dns_map: HashMap<u16, (LocalEp, StdInstant)> = HashMap::new();
+    let mut flow_map: HashMap<String, (LocalEp, StdInstant)> = HashMap::new();
+    let mut last_gc = StdInstant::now();
     log::info!("udp relay session ready");
 
     loop {
         if tun.stop.load(Ordering::Relaxed) {
             break;
+        }
+
+        // 0) 每 5 秒清理过期的 DNS 映射与 UDP 流表，避免长时间使用内存只增不减
+        if last_gc.elapsed() >= Duration::from_secs(GC_INTERVAL_SECS) {
+            let now = StdInstant::now();
+            dns_map.retain(|_, (_, t)| {
+                now.duration_since(*t) < Duration::from_secs(DNS_TTL_SECS)
+            });
+            flow_map.retain(|_, (_, t)| {
+                now.duration_since(*t) < Duration::from_secs(UDP_FLOW_TTL_SECS)
+            });
+            last_gc = now;
         }
 
         // 1) 短等一个远端应答（mpsc::Receiver::recv 可安全取消，超时不丢包）
@@ -510,11 +538,16 @@ async fn udp_worker(
                 // DNS 应答按事务 ID 精确回给原查询端口，避免并发交错回错端口。
                 let by_dns = if src == DNS_UPSTREAM && payload.len() >= 12 {
                     let id = u16::from_be_bytes([payload[0], payload[1]]);
-                    dns_map.remove(&id)
+                    dns_map.remove(&id).map(|(ep, _)| ep)
                 } else {
                     None
                 };
-                let ep = by_dns.or_else(|| flow_map.get(&src).copied());
+                let ep = by_dns.or_else(|| flow_map.get(&src).map(|(ep, _)| *ep));
+                if ep.is_some() {
+                    if let Some((_, t)) = flow_map.get_mut(&src) {
+                        *t = StdInstant::now();
+                    }
+                }
                 match ep {
                     Some(ep) => write_tun(fd, &lock, &build_udp_reply(ep, &payload)),
                     None => log::debug!("udp reply without local flow: {}", src),
@@ -538,6 +571,7 @@ async fn udp_worker(
                         session = s;
                         dns_map.clear();
                         flow_map.clear();
+                        tun.reconnects.fetch_add(1, Ordering::Relaxed);
                         log::info!("udp session rebuilt");
                     }
                     None => {
@@ -559,10 +593,11 @@ async fn udp_worker(
             if flow_map.len() >= FLOW_MAP_MAX {
                 flow_map.clear();
             }
+            let now = StdInstant::now();
             if let Some(id) = req.dns_id {
-                dns_map.insert(id, req.ep);
+                dns_map.insert(id, (req.ep, now));
             }
-            flow_map.insert(req.target.clone(), req.ep);
+            flow_map.insert(req.target.clone(), (req.ep, now));
             match session.send(&req.payload, &req.target) {
                 Ok(()) => {
                     tun.udp_sent.fetch_add(1, Ordering::Relaxed);
@@ -620,6 +655,7 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
         shared: shared.clone(),
         packets: tun.packets.clone(),
         bytes: tun.bytes.clone(),
+        ipv6: tun.ipv6.clone(),
         write_lock: write_lock.clone(),
     };
 
@@ -724,6 +760,7 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
                     to_remote: to_tx,
                     from_remote: from_rx,
                     pending: Vec::new(),
+                    last_active: StdInstant::now(),
                 },
             );
             let c = client.clone();
@@ -738,8 +775,16 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
             log::info!("new tcp conn -> {}", target);
         }
 
-        // 5) 双向搬运 socket <-> hy2 stream
+        // 5) 双向搬运 socket <-> hy2 stream（含空闲连接超时清理）
+        let mut idle_remove: Vec<SocketHandle> = Vec::new();
         for (h, conn) in conns.iter_mut() {
+            if conn.last_active.elapsed() > Duration::from_secs(TCP_IDLE_TTL_SECS) {
+                let s = sockets.get_mut::<tcp::Socket>(*h);
+                s.close();
+                idle_remove.push(*h);
+                continue;
+            }
+            let mut touched = false;
             let s = sockets.get_mut::<tcp::Socket>(*h);
             // 先确认 channel 有空位再从 socket 取数据，避免取出来却发不出去导致丢包
             while s.can_recv() {
@@ -747,6 +792,7 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
                     Ok(permit) => match s.recv_slice(&mut buf) {
                         Ok(n) if n > 0 => {
                             permit.send(buf[..n].to_vec());
+                            touched = true;
                         }
                         _ => break,
                     },
@@ -756,19 +802,25 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
             if conn.pending.is_empty() {
                 if let Ok(d) = conn.from_remote.try_recv() {
                     conn.pending = d;
+                    touched = true;
                 }
             }
             if !conn.pending.is_empty() {
                 match s.send_slice(&conn.pending) {
                     Ok(n) => {
                         conn.pending.drain(..n);
+                        touched = true;
                     }
                     Err(_) => {
                         s.close();
                     }
                 }
             }
+            if touched {
+                conn.last_active = StdInstant::now();
+            }
         }
+        to_remove.extend(idle_remove.drain(..));
 
         for h in to_remove.drain(..) {
             conns.remove(&h);
@@ -901,6 +953,8 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeAttachTun(
         udp: Arc::new(AtomicU64::new(0)),
         udp_sent: Arc::new(AtomicU64::new(0)),
         udp_ok: Arc::new(AtomicBool::new(false)),
+        ipv6: Arc::new(AtomicU64::new(0)),
+        reconnects: Arc::new(AtomicU64::new(0)),
     };
     let thread_handle = handle.clone();
     let rt_handle = engine.rt.handle().clone();
@@ -961,7 +1015,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
                         "UDP 会话初始化中"
                     };
                     format!(
-                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {}",
+                        "\nTUN：{} 个 IP 包 / {} 字节 · TCP 连接 {} · DNS 查询 {}\nUDP：收到 {} / 已转发 {} · {}\nIPv6 封堵 {} 个包 · UDP 会话重建 {} 次",
                         h.packets.load(Ordering::Relaxed),
                         h.bytes.load(Ordering::Relaxed),
                         h.conns.load(Ordering::Relaxed),
@@ -969,6 +1023,8 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeGetStatus(
                         udp,
                         h.udp_sent.load(Ordering::Relaxed),
                         mode,
+                        h.ipv6.load(Ordering::Relaxed),
+                        h.reconnects.load(Ordering::Relaxed),
                     )
                 }
                 None => "\nTUN：数据面未启动".to_string(),

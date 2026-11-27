@@ -14,11 +14,17 @@ import android.os.ParcelFileDescriptor
 class Hy2VpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var enginePtr: Long = 0L
+    private var disconnected = false
     private val handler = Handler(Looper.getMainLooper())
 
-    // 每 400ms 把 Rust 侧状态（握手 + TUN 计数 + 连接数）同步给界面
+    // 每 400ms 把 Rust 侧状态同步给界面。
+    // 断开后不再 postDelayed，且不再写 TunnelStatus.text —— 避免竞态把「已断开」覆盖掉。
     private val statusPoll = object : Runnable {
         override fun run() {
+            if (disconnected || !TunnelStatus.connected) {
+                TunnelStatus.text = "已断开"
+                return
+            }
             if (enginePtr != 0L) {
                 try {
                     TunnelStatus.text = Hy2Bridge.nativeGetStatus(enginePtr) ?: "状态读取失败"
@@ -42,7 +48,8 @@ class Hy2VpnService : VpnService() {
             ACTION_CONNECT -> connect()
             ACTION_DISCONNECT -> disconnect()
         }
-        return START_STICKY
+        // 断开后不希望被系统自动拉起（START_STICKY 会让服务常驻、通知不消失）。
+        return START_NOT_STICKY
     }
 
     private fun connect() {
@@ -59,25 +66,19 @@ class Hy2VpnService : VpnService() {
             return
         }
 
-        // Stage 2 · Step 3：恢复全局路由，所有 App 流量进 TUN。
-        // - 虚拟 DNS 10.0.0.1:53 与全局 UDP 由 Rust 侧经 hy2 UdpSession 转发
-        //   （服务端未通告 UDP 时，Rust 侧自动把 DNS 降级为 DNS-over-TCP）
+        // Stage 2 · Step 4：
+        // - 全局路由 0.0.0.0/0 + ::/0，把 IPv6 也劫持进 TUN（Rust 侧丢弃，防止绕隧道泄漏）
+        // - 虚拟 DNS 10.0.0.1:53 与全局 UDP 经 hy2 UdpSession 转发
         // - 必须排除自身，否则 hy2 的 QUIC 流量也被劫持进 TUN 造成回环死锁
-        val builder = Builder()
-            .setSession("hy2box")
-            .setMtu(1500)
-            .addAddress("10.0.0.2", 24)
-            .addRoute("0.0.0.0", 0)
-            .addDnsServer("10.0.0.1")
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (e: Exception) {
-            android.util.Log.w("hy2box", "addDisallowedApplication failed", e)
+        var pfd = buildVpnBuilder(true).establish()
+        if (pfd == null) {
+            // 少数 ROM 不接受 IPv6 地址/路由，退回纯 IPv4，保证 VPN 仍能建立
+            android.util.Log.w("hy2box", "establish with IPv6 failed, retry IPv4-only")
+            pfd = buildVpnBuilder(false).establish()
         }
-
-        val pfd = builder.establish()
         if (pfd == null) {
             TunnelStatus.text = "VPN 权限未授予或 TUN 建立失败"
+            Hy2Bridge.nativeStop(enginePtr)
             return
         }
 
@@ -91,14 +92,49 @@ class Hy2VpnService : VpnService() {
             return
         }
 
+        disconnected = false
+        TunnelStatus.connected = true
         handler.removeCallbacks(statusPoll)
         handler.post(statusPoll)
     }
 
+    private fun buildVpnBuilder(includeIpv6: Boolean): Builder {
+        val b = Builder()
+            .setSession("hy2box")
+            .setMtu(1500)
+            .addAddress("10.0.0.2", 24)
+            .addRoute("0.0.0.0", 0)
+            .addDnsServer("10.0.0.1")
+        if (includeIpv6) {
+            try {
+                b.addAddress("fd00::1", 64)
+                b.addRoute("::", 0)
+            } catch (e: Exception) {
+                android.util.Log.w("hy2box", "IPv6 address/route unavailable", e)
+            }
+        }
+        try {
+            b.addDisallowedApplication(packageName)
+        } catch (e: Exception) {
+            android.util.Log.w("hy2box", "addDisallowedApplication failed", e)
+        }
+        return b
+    }
+
+    // 幂等：onStartCommand(ACTION_DISCONNECT) 与 onDestroy 可能都会走到这里。
     private fun disconnect() {
+        if (disconnected) return
+        disconnected = true
+        TunnelStatus.connected = false
         handler.removeCallbacks(statusPoll)
-        Hy2Bridge.nativeDetachTun(enginePtr)
-        Hy2Bridge.nativeStop(enginePtr)
+        if (enginePtr != 0L) {
+            try {
+                Hy2Bridge.nativeDetachTun(enginePtr)
+                Hy2Bridge.nativeStop(enginePtr)
+            } catch (t: Throwable) {
+                android.util.Log.w("hy2box", "native disconnect failed", t)
+            }
+        }
         // fd 已交给 Rust 并由其关闭，这里不要重复 close
         tun = null
         TunnelStatus.text = "已断开"
@@ -134,7 +170,7 @@ class Hy2VpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val text = "Step 3：TCP + UDP 全局经 hy2 隧道"
+        val text = "Step 4：TCP + UDP 全局经 hy2 隧道（IPv6 已封堵）"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("hy2box")

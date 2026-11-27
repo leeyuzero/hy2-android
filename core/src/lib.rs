@@ -3,6 +3,7 @@ use jni::objects::JClass;
 use jni::sys::{jboolean, jint, jlong, jstring};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant as StdInstant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::timeout;
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
@@ -22,7 +24,10 @@ const TUN_ADDR: [u8; 4] = [10, 0, 0, 2];
 const VIRTUAL_DNS: [u8; 4] = [10, 0, 0, 1];
 const DNS_UPSTREAM: &str = "8.8.8.8:53";
 const MTU: usize = 1500;
-const SOCK_BUF: usize = 32768;
+const SOCK_BUF: usize = 16384;
+const LISTEN_BACKLOG: usize = 8;
+const MAX_KNOWN_PORTS: usize = 32;
+const PORT_IDLE_TTL_SECS: u64 = 120;
 const UDP_POLL_MS: u64 = 20;
 const FLOW_MAP_MAX: usize = 4096;
 const DNS_TTL_SECS: u64 = 30;
@@ -49,6 +54,8 @@ struct Engine {
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     status: Arc<StdMutex<String>>,
     tun: StdMutex<Option<TunHandle>>,
+    // 数据面 OS 线程：destroy 前必须先 stop 并 join，避免 Runtime 先于线程销毁
+    stack_thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
     client: StdMutex<Option<Arc<rsteria2::ReconnectableClient>>>,
 }
 
@@ -69,9 +76,8 @@ fn init_logger() {
 
 // ---------- 原始 IP 包解析（只用于分流，不改动包内容） ----------
 
-// 提取「新 SYN」的目标端口：smoltcp 的 listen() 不允许 port=0，
-// 必须按目标端口动态创建监听 socket，因此要在包进协议栈前先看到端口。
-fn syn_port(buf: &[u8]) -> Option<u16> {
+// 任意 IPv4 TCP 包的目标端口，用于刷新 known_ports 的活跃时间。
+fn tcp_dst_port(buf: &[u8]) -> Option<u16> {
     if buf.len() < 20 || buf[0] >> 4 != 4 {
         return None;
     }
@@ -80,9 +86,17 @@ fn syn_port(buf: &[u8]) -> Option<u16> {
         return None;
     }
     let t = &buf[ihl..];
-    let flags = t[13];
+    Some(u16::from_be_bytes([t[2], t[3]]))
+}
+
+// 提取「新 SYN」的目标端口：smoltcp 的 listen() 不允许 port=0，
+// 必须按目标端口动态创建监听 socket，因此要在包进协议栈前先看到端口。
+fn syn_port(buf: &[u8]) -> Option<u16> {
+    let port = tcp_dst_port(buf)?;
+    let ihl = ((buf[0] & 0x0f) as usize) * 4;
+    let flags = buf[ihl + 13];
     if flags & 0x02 != 0 && flags & 0x10 == 0 {
-        Some(u16::from_be_bytes([t[2], t[3]]))
+        Some(port)
     } else {
         None
     }
@@ -233,14 +247,38 @@ fn build_udp_reply(ep: LocalEp, payload: &[u8]) -> Vec<u8> {
     p
 }
 
-// TUN fd 会被三个线程写（smoltcp TxToken / UDP worker / DNS 降级 worker）。
-// 每次 write 对应一个完整 IP 包，用同一把锁保证包边界不被打散。
-fn write_tun(fd: i32, lock: &StdMutex<()>, pkt: &[u8]) {
-    if let Ok(_guard) = lock.lock() {
-        unsafe {
-            libc::write(fd, pkt.as_ptr() as *const libc::c_void, pkt.len());
+// TUN fd 由 Arc<OwnedFd> 共享所有权：最后一个引用 drop 时才 close，
+// 异步 worker 即使比 run_stack 活得久也不会写到被系统复用的 fd 上。
+// 单次 write 对应一个完整 IP 包；显式处理 EINTR / EAGAIN 与短写，避免静默丢包。
+fn write_tun(fd: &Arc<OwnedFd>, lock: &StdMutex<()>, pkt: &[u8]) {
+    let raw = fd.as_raw_fd();
+    let _guard = match lock.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let mut off = 0usize;
+    for _ in 0..16 {
+        let n = unsafe {
+            libc::write(raw, pkt[off..].as_ptr() as *const libc::c_void, pkt.len() - off)
+        };
+        if n > 0 {
+            off += n as usize;
+            if off >= pkt.len() {
+                return;
+            }
+            continue;
         }
+        if n == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if err == libc::EINTR || err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+            continue;
+        }
+        log::warn!("tun write failed: {}", std::io::Error::last_os_error());
+        return;
     }
+    log::warn!("tun write incomplete: {}/{} bytes", off, pkt.len());
 }
 
 // ---------- smoltcp Device：包装 TUN fd ----------
@@ -248,12 +286,12 @@ fn write_tun(fd: i32, lock: &StdMutex<()>, pkt: &[u8]) {
 struct Shared {
     cache: VecDeque<Vec<u8>>, // 等监听 socket 建好再投递的 TCP SYN
     new_ports: VecDeque<u16>,
-    known_ports: HashSet<u16>,
-    udp_reqs: VecDeque<UdpReq>, // 所有 UDP 包在此排队，由 tokio 侧转发
+    known_ports: HashMap<u16, StdInstant>, // 端口 -> 最近活跃时间，用于空闲回收
+    udp_reqs: VecDeque<UdpReq>,           // 所有 UDP 包在此排队，由 tokio 侧转发
 }
 
 struct TunDevice {
-    fd: i32,
+    fd: Arc<OwnedFd>,
     shared: Rc<RefCell<Shared>>,
     packets: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
@@ -274,7 +312,7 @@ impl phy::RxToken for MyRxToken {
 }
 
 struct MyTxToken {
-    fd: i32,
+    fd: Arc<OwnedFd>,
     write_lock: Arc<StdMutex<()>>,
 }
 impl phy::TxToken for MyTxToken {
@@ -284,7 +322,7 @@ impl phy::TxToken for MyTxToken {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        write_tun(self.fd, &self.write_lock, &buffer);
+        write_tun(&self.fd, &self.write_lock, &buffer);
         result
     }
 }
@@ -300,68 +338,85 @@ impl Device for TunDevice {
         caps
     }
 
+    // P1-7：smoltcp 0.14 的 Interface::poll() 内部有 ingress loop，
+    // receive() 返回 None 会 break 整轮。所以这里自己循环读 TUN：
+    // IPv6 / UDP / 新 SYN 都 continue 掉，直到拿到一个该交给协议栈的 TCP 包或 EAGAIN。
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        {
+        loop {
+            {
+                let mut sh = self.shared.borrow_mut();
+                if let Some(pkt) = sh.cache.pop_front() {
+                    return Some((
+                        MyRxToken { buffer: pkt },
+                        MyTxToken {
+                            fd: self.fd.clone(),
+                            write_lock: self.write_lock.clone(),
+                        },
+                    ));
+                }
+            }
+
+            let mut buf = vec![0u8; 65536];
+            let n = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                return None; // O_NONBLOCK 下无数据
+            }
+            buf.truncate(n as usize);
+            self.packets.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+
+            // Step 4：全局路由已加 ::/0，IPv6 全部进 TUN 后在此直接丢弃，
+            // 避免它走物理网卡绕隧道泄漏。不交给 smoltcp（只启用 proto-ipv4），也不回 ICMPv6。
+            if buf.len() >= 20 && buf[0] >> 4 == 6 {
+                self.ipv6.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // 所有 IPv4 UDP 包都不进 smoltcp：可转发的交给 worker，其余直接丢弃。
+            // 不交给协议栈可避免 any_ip 下回 ICMP port unreachable 让 App 误判连接失败。
+            if buf.len() >= 20 && buf[0] >> 4 == 4 && buf[9] == 17 {
+                if let Some(req) = parse_udp(&buf) {
+                    self.shared.borrow_mut().udp_reqs.push_back(req);
+                }
+                continue;
+            }
+
             let mut sh = self.shared.borrow_mut();
-            if let Some(pkt) = sh.cache.pop_front() {
-                return Some((
-                    MyRxToken { buffer: pkt },
-                    MyTxToken {
-                        fd: self.fd,
-                        write_lock: self.write_lock.clone(),
-                    },
-                ));
+            if let Some(port) = tcp_dst_port(&buf) {
+                if let Some(t) = sh.known_ports.get_mut(&port) {
+                    *t = StdInstant::now();
+                }
             }
-        }
-
-        let mut buf = vec![0u8; 65536];
-        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            return None; // O_NONBLOCK 下无数据
-        }
-        buf.truncate(n as usize);
-        self.packets.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(n as u64, Ordering::Relaxed);
-
-        // Step 4：全局路由已加 ::/0，IPv6 全部进 TUN 后在此直接丢弃，
-        // 避免它走物理网卡绕隧道泄漏。不交给 smoltcp（只启用 proto-ipv4），也不回 ICMPv6。
-        if buf.len() >= 20 && buf[0] >> 4 == 6 {
-            self.ipv6.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-
-        // 所有 IPv4 UDP 包都不进 smoltcp：可转发的交给 worker，其余直接丢弃。
-        // 不交给协议栈可避免 any_ip 下回 ICMP port unreachable 让 App 误判连接失败。
-        if buf.len() >= 20 && buf[0] >> 4 == 4 && buf[9] == 17 {
-            if let Some(req) = parse_udp(&buf) {
-                self.shared.borrow_mut().udp_reqs.push_back(req);
+            if let Some(port) = syn_port(&buf) {
+                if !sh.known_ports.contains_key(&port) {
+                    // 缓存该 SYN，本轮继续读后面的包；外层循环先建好 backlog，
+                    // 下一轮 poll 的 ingress loop 会连续投递，避免同端口并发 SYN 被 RST。
+                    sh.new_ports.push_back(port);
+                    sh.cache.push_back(buf);
+                    continue;
+                }
             }
-            return None;
-        }
+            drop(sh);
 
-        if let Some(port) = syn_port(&buf) {
-            let mut sh = self.shared.borrow_mut();
-            if !sh.known_ports.contains(&port) {
-                // 缓存该 SYN，本轮返回 None；外层循环先建好监听 socket，
-                // 下一轮再投递，避免被 smoltcp 回 RST 导致连接直接失败。
-                sh.new_ports.push_back(port);
-                sh.cache.push_back(buf);
-                return None;
-            }
+            return Some((
+                MyRxToken { buffer: buf },
+                MyTxToken {
+                    fd: self.fd.clone(),
+                    write_lock: self.write_lock.clone(),
+                },
+            ));
         }
-
-        Some((
-            MyRxToken { buffer: buf },
-            MyTxToken {
-                fd: self.fd,
-                write_lock: self.write_lock.clone(),
-            },
-        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(MyTxToken {
-            fd: self.fd,
+            fd: self.fd.clone(),
             write_lock: self.write_lock.clone(),
         })
     }
@@ -374,22 +429,39 @@ struct Conn {
     from_remote: mpsc::Receiver<Vec<u8>>,
     pending: Vec<u8>,
     last_active: StdInstant,
+    connected: Arc<AtomicBool>, // tcp_connect 是否成功，决定远端结束时发 FIN 还是 RST
+    remote_closed: bool,       // from_remote 已 Disconnected
+    app_fin: bool,             // 已向 relay 发送过 EOF 标记（空 Vec）
+    close_done: bool,          // 已请求 smoltcp 关闭，等状态机走完再 remove
 }
 
 async fn tcp_relay(
     stream: rsteria2::DuplexStream,
     mut to_rx: mpsc::Receiver<Vec<u8>>,
     from_tx: mpsc::Sender<Vec<u8>>,
+    connected: Arc<AtomicBool>,
 ) {
+    connected.store(true, Ordering::Relaxed);
     let (mut r, mut w) = tokio::io::split(stream);
     let mut buf = vec![0u8; 16384];
+    let mut write_closed = false;
     loop {
         tokio::select! {
-            item = to_rx.recv() => match item {
+            item = to_rx.recv(), if !write_closed => match item {
+                // 空 Vec 是主循环发来的「App 侧 FIN」标记：半关闭写方向，
+                // 然后继续读远端剩余数据直到 EOF，让 from_tx 自然 drop。
+                Some(data) if data.is_empty() => {
+                    let _ = w.shutdown().await;
+                    write_closed = true;
+                }
                 Some(data) => {
                     if w.write_all(&data).await.is_err() { break; }
                 }
-                None => break,
+                None => {
+                    let _ = w.shutdown().await;
+                    write_closed = true;
+                    break;
+                }
             },
             res = r.read(&mut buf) => match res {
                 Ok(0) | Err(_) => break,
@@ -399,14 +471,18 @@ async fn tcp_relay(
             },
         }
     }
+    if !write_closed {
+        let _ = w.shutdown().await;
+    }
 }
 
 // 降级路径：服务端未通告 UDP 时，DNS 用 DNS over TCP 并发查询（每个查询独立 task）。
 async fn dns_tcp_query(
     client: Arc<rsteria2::ReconnectableClient>,
     req: UdpReq,
-    fd: i32,
+    fd: Arc<OwnedFd>,
     lock: Arc<StdMutex<()>>,
+    stop: Arc<AtomicBool>,
 ) {
     let mut s = match timeout(Duration::from_secs(10), client.tcp_connect(DNS_UPSTREAM)).await {
         Ok(Ok(s)) => s,
@@ -439,20 +515,27 @@ async fn dns_tcp_query(
         Ok(Ok(_)) => {}
         _ => return,
     }
-    write_tun(fd, &lock, &build_udp_reply(req.ep, &resp));
+    // 最长约 26 秒的窗口：写回前再确认数据面没停，避免往已断开的隧道回包。
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    write_tun(&fd, &lock, &build_udp_reply(req.ep, &resp));
 }
 
 async fn dns_tcp_worker(
     client: Arc<rsteria2::ReconnectableClient>,
-    fd: i32,
+    fd: Arc<OwnedFd>,
     lock: Arc<StdMutex<()>>,
+    stop: Arc<AtomicBool>,
     mut rx: mpsc::Receiver<UdpReq>,
 ) {
     while let Some(req) = rx.recv().await {
         let c = client.clone();
+        let f = fd.clone();
         let l = lock.clone();
+        let s = stop.clone();
         tokio::spawn(async move {
-            dns_tcp_query(c, req, fd, l).await;
+            dns_tcp_query(c, req, f, l, s).await;
         });
     }
 }
@@ -482,9 +565,10 @@ async fn fallback_loop(
 // 全局 UDP 会话：单个 task 独占 UdpSession（recv 需要 &mut self）。
 // 用「20ms 短等应答 + try_recv 批量发包」的轮询，避开 select! 里
 // recv(&mut) 与 send(&self) 同时借用 session 的冲突，编译期确定安全。
+// 注：P0-4（按本地流每流一个 UdpSession）将在下一批重写这一层。
 async fn udp_worker(
     client: Arc<rsteria2::ReconnectableClient>,
-    fd: i32,
+    fd: Arc<OwnedFd>,
     lock: Arc<StdMutex<()>>,
     tun: TunHandle,
     mut rx: mpsc::Receiver<UdpReq>,
@@ -531,7 +615,7 @@ async fn udp_worker(
             last_gc = now;
         }
 
-        // 1) 短等一个远端应答（mpsc::Receiver::recv 可安全取消，超时不丢包）
+        // 1) 短等一个远端应答
         let recv_res = timeout(Duration::from_millis(UDP_POLL_MS), session.recv()).await;
         match recv_res {
             Ok(Ok((payload, src))) => {
@@ -549,7 +633,7 @@ async fn udp_worker(
                     }
                 }
                 match ep {
-                    Some(ep) => write_tun(fd, &lock, &build_udp_reply(ep, &payload)),
+                    Some(ep) => write_tun(&fd, &lock, &build_udp_reply(ep, &payload)),
                     None => log::debug!("udp reply without local flow: {}", src),
                 }
             }
@@ -611,24 +695,26 @@ async fn udp_worker(
 
 // ---------- 同步侧：smoltcp 主循环（独占一个 OS 线程） ----------
 
-fn set_nonblocking(fd: i32) {
+fn set_nonblocking(fd: &Arc<OwnedFd>) {
+    let raw = fd.as_raw_fd();
     unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
+        let flags = libc::fcntl(raw, libc::F_GETFL);
         if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
     }
 }
 
-fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tun: TunHandle) {
-    set_nonblocking(fd);
-    log::info!("stack started fd={}", fd);
+fn run_stack(fd: Arc<OwnedFd>, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tun: TunHandle) {
+    set_nonblocking(&fd);
+    let raw = fd.as_raw_fd();
+    log::info!("stack started fd={}", raw);
 
     let write_lock = Arc::new(StdMutex::new(()));
     let shared = Rc::new(RefCell::new(Shared {
         cache: VecDeque::new(),
         new_ports: VecDeque::new(),
-        known_ports: HashSet::new(),
+        known_ports: HashMap::new(),
         udp_reqs: VecDeque::new(),
     }));
     let (udp_tx, udp_rx) = mpsc::channel::<UdpReq>(256);
@@ -636,22 +722,25 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
 
     {
         let c = client.clone();
+        let f = fd.clone();
         let l = write_lock.clone();
         let t = tun.clone();
         rt.spawn(async move {
-            udp_worker(c, fd, l, t, udp_rx, dns_tcp_tx).await;
+            udp_worker(c, f, l, t, udp_rx, dns_tcp_tx).await;
         });
     }
     {
         let c = client.clone();
+        let f = fd.clone();
         let l = write_lock.clone();
+        let s = tun.stop.clone();
         rt.spawn(async move {
-            dns_tcp_worker(c, fd, l, dns_tcp_rx).await;
+            dns_tcp_worker(c, f, l, s, dns_tcp_rx).await;
         });
     }
 
     let mut device = TunDevice {
-        fd,
+        fd: fd.clone(),
         shared: shared.clone(),
         packets: tun.packets.clone(),
         bytes: tun.bytes.clone(),
@@ -682,11 +771,24 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
 
     while !tun.stop.load(Ordering::Relaxed) {
         // 1) 取走 Device 攒下的新端口与 UDP 请求
-        let mut need_listen: Vec<u16> = Vec::new();
         {
             let mut sh = shared.borrow_mut();
             while let Some(p) = sh.new_ports.pop_front() {
-                sh.known_ports.insert(p);
+                sh.known_ports.insert(p, StdInstant::now());
+            }
+            // 端口表上限：超限时淘汰最久未见的，防止 backlog 叠出无界内存
+            while sh.known_ports.len() > MAX_KNOWN_PORTS {
+                let oldest = sh
+                    .known_ports
+                    .iter()
+                    .min_by(|a, b| a.1.cmp(b.1))
+                    .map(|(p, _)| *p);
+                match oldest {
+                    Some(p) => {
+                        sh.known_ports.remove(&p);
+                    }
+                    None => break,
+                }
             }
             while let Some(req) = sh.udp_reqs.pop_front() {
                 let is_dns = req.dns_id.is_some();
@@ -700,20 +802,57 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
             }
         }
 
-        // 2) 每个已见端口至少保留一个处于 Listen 状态的 socket（无 backlog，必须补）
+        // 2) 统计现有 socket：每端口 Listen 数量、Listen handle、活跃连接端口
         let handles: Vec<SocketHandle> = sockets.iter().map(|(h, _)| h).collect();
-        let mut listening: HashSet<u16> = HashSet::new();
+        let mut listen_count: HashMap<u16, usize> = HashMap::new();
+        let mut listen_handles: HashMap<u16, Vec<SocketHandle>> = HashMap::new();
+        let mut active_ports: HashSet<u16> = HashSet::new();
         for h in &handles {
             let s = sockets.get::<tcp::Socket>(*h);
             if s.state() == tcp::State::Listen {
-                listening.insert(s.listen_endpoint().port);
+                let p = s.listen_endpoint().port;
+                *listen_count.entry(p).or_insert(0) += 1;
+                listen_handles.entry(p).or_default().push(*h);
+            } else if let Some(ep) = s.local_endpoint() {
+                active_ports.insert(ep.port);
             }
         }
+
+        // 2a) 空闲端口回收：超过 TTL 且无活跃连接，连同它的 Listen socket 一起移除。
+        //     这是 P0-2 backlog 的必要配套，否则每端口 8 个 socket 会让内存只增不减。
+        let mut retired: Vec<u16> = Vec::new();
+        {
+            let mut sh = shared.borrow_mut();
+            let now = StdInstant::now();
+            sh.known_ports.retain(|p, t| {
+                let keep = now.duration_since(*t) <= Duration::from_secs(PORT_IDLE_TTL_SECS)
+                    || active_ports.contains(p);
+                if !keep {
+                    retired.push(*p);
+                }
+                keep
+            });
+        }
+        for p in retired {
+            if let Some(hs) = listen_handles.remove(&p) {
+                for h in hs {
+                    conns.remove(&h);
+                    sockets.remove(h);
+                }
+            }
+            listen_count.remove(&p);
+        }
+
+        // 2b) 每个已见端口维持 LISTEN_BACKLOG 个 Listen socket。
+        //     smoltcp 的 listen socket 没有 backlog 概念，一轮 poll() 的 ingress loop
+        //     会连续吃多个同端口 SYN，只有靠「预留多个」才不会被 RST。
+        let mut need_listen: Vec<u16> = Vec::new();
         {
             let sh = shared.borrow();
-            for p in sh.known_ports.iter().copied() {
-                if !listening.contains(&p) {
-                    need_listen.push(p);
+            for p in sh.known_ports.keys() {
+                let have = listen_count.get(p).copied().unwrap_or(0);
+                for _ in have..LISTEN_BACKLOG {
+                    need_listen.push(*p);
                 }
             }
         }
@@ -754,6 +893,7 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
         for (h, target) in new_conns {
             let (to_tx, to_rx) = mpsc::channel::<Vec<u8>>(64);
             let (from_tx, from_rx) = mpsc::channel::<Vec<u8>>(64);
+            let connected = Arc::new(AtomicBool::new(false));
             conns.insert(
                 h,
                 Conn {
@@ -761,13 +901,18 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
                     from_remote: from_rx,
                     pending: Vec::new(),
                     last_active: StdInstant::now(),
+                    connected: connected.clone(),
+                    remote_closed: false,
+                    app_fin: false,
+                    close_done: false,
                 },
             );
             let c = client.clone();
             let t = target.clone();
+            let ok = connected.clone();
             rt.spawn(async move {
                 match timeout(Duration::from_secs(15), c.tcp_connect(&t)).await {
-                    Ok(Ok(s)) => tcp_relay(s, to_rx, from_tx).await,
+                    Ok(Ok(s)) => tcp_relay(s, to_rx, from_tx, ok).await,
                     Ok(Err(e)) => log::error!("tcp_connect {} failed: {}", t, e),
                     Err(_) => log::error!("tcp_connect {} timeout", t),
                 }
@@ -775,52 +920,85 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
             log::info!("new tcp conn -> {}", target);
         }
 
-        // 5) 双向搬运 socket <-> hy2 stream（含空闲连接超时清理）
-        let mut idle_remove: Vec<SocketHandle> = Vec::new();
+        // 5) 双向搬运 socket <-> hy2 stream，并正确传播 FIN / RST
         for (h, conn) in conns.iter_mut() {
-            if conn.last_active.elapsed() > Duration::from_secs(TCP_IDLE_TTL_SECS) {
-                let s = sockets.get_mut::<tcp::Socket>(*h);
-                s.close();
-                idle_remove.push(*h);
+            if conn.close_done {
+                // 已请求关闭：等 smoltcp 状态机把 FIN 发出去、进入 Closed/TimeWait，
+                // 由步骤 4 统一回收，绝不当轮 remove（否则 FIN 根本发不出去）。
                 continue;
             }
             let mut touched = false;
             let s = sockets.get_mut::<tcp::Socket>(*h);
-            // 先确认 channel 有空位再从 socket 取数据，避免取出来却发不出去导致丢包
-            while s.can_recv() {
-                match conn.to_remote.try_reserve() {
-                    Ok(permit) => match s.recv_slice(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            permit.send(buf[..n].to_vec());
-                            touched = true;
-                        }
-                        _ => break,
-                    },
-                    Err(_) => break,
-                }
+
+            if conn.last_active.elapsed() > Duration::from_secs(TCP_IDLE_TTL_SECS) {
+                s.close();
+                conn.close_done = true;
+                continue;
             }
-            if conn.pending.is_empty() {
-                if let Ok(d) = conn.from_remote.try_recv() {
-                    conn.pending = d;
+
+            // App 侧 FIN：收到 FIN 后 may_recv()=false 且无待读数据。
+            // 发一个空 Vec 作为 EOF 标记，让 relay 对远端执行 shutdown()。
+            if !conn.app_fin && !s.may_recv() && !s.can_recv() {
+                if conn.to_remote.try_send(Vec::new()).is_ok() {
+                    conn.app_fin = true;
                     touched = true;
                 }
             }
+
+            // App -> 远端
+            if !conn.remote_closed {
+                while s.can_recv() {
+                    match conn.to_remote.try_reserve() {
+                        Ok(permit) => match s.recv_slice(&mut buf) {
+                            Ok(n) if n > 0 => {
+                                permit.send(buf[..n].to_vec());
+                                touched = true;
+                            }
+                            _ => break,
+                        },
+                        Err(_) => break,
+                    }
+                }
+            }
+
+            // 远端 -> App：先把上一段发完
             if !conn.pending.is_empty() {
                 match s.send_slice(&conn.pending) {
                     Ok(n) => {
                         conn.pending.drain(..n);
                         touched = true;
                     }
-                    Err(_) => {
-                        s.close();
+                    Err(_) => {}
+                }
+            }
+
+            // pending 清空后才判断 relay 是否结束：
+            // Disconnected + 连接成功过 -> close() 给 App 发 FIN；
+            // Disconnected + 从未连上   -> abort() 给 App 发 RST（立刻报错，不再等 300s）。
+            if conn.pending.is_empty() && !conn.remote_closed {
+                match conn.from_remote.try_recv() {
+                    Ok(d) => {
+                        conn.pending = d;
+                        touched = true;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        conn.remote_closed = true;
+                        conn.close_done = true;
+                        if conn.connected.load(Ordering::Relaxed) {
+                            s.close();
+                        } else {
+                            s.abort();
+                        }
+                        touched = true;
                     }
                 }
             }
+
             if touched {
                 conn.last_active = StdInstant::now();
             }
         }
-        to_remove.extend(idle_remove.drain(..));
 
         for h in to_remove.drain(..) {
             conns.remove(&h);
@@ -831,7 +1009,7 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
         // 6) 最多等 20ms 的 fd 可读，兼作 channel 数据的轮询间隔
         unsafe {
             let mut pfd = libc::pollfd {
-                fd,
+                fd: raw,
                 events: libc::POLLIN,
                 revents: 0,
             };
@@ -839,10 +1017,10 @@ fn run_stack(fd: i32, client: Arc<rsteria2::ReconnectableClient>, rt: Handle, tu
         }
     }
 
-    unsafe {
-        libc::close(fd);
-    }
-    log::info!("stack stopped fd={}", fd);
+    // 不再 libc::close(fd)：Arc<OwnedFd> 的最后一个引用 drop 时才关闭，
+    // 异步 worker 即使还持有 clone 也不会写到被系统复用的 fd 上。
+    drop(fd);
+    log::info!("stack stopped fd={}", raw);
 }
 
 // ---------- JNI ----------
@@ -856,6 +1034,7 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeInit(_env: JNIEnv, _class
         handle: Mutex::new(None),
         status: Arc::new(StdMutex::new("未连接".to_string())),
         tun: StdMutex::new(None),
+        stack_thread: StdMutex::new(None),
         client: StdMutex::new(None),
     });
     Box::into_raw(engine) as jlong
@@ -944,6 +1123,19 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeAttachTun(
         }
     };
 
+    // 补充发现 5：先停旧数据面线程并 join，再挂新 fd。
+    // 否则旧线程仍在 close() 旧 fd 时，系统可能把同一个 fd 号分配给新 TUN。
+    if let Ok(mut jg) = engine.stack_thread.lock() {
+        if let Some(j) = jg.take() {
+            if let Ok(g) = engine.tun.lock() {
+                if let Some(h) = g.as_ref() {
+                    h.stop.store(true, Ordering::Relaxed);
+                }
+            }
+            let _ = j.join();
+        }
+    }
+
     let handle = TunHandle {
         stop: Arc::new(AtomicBool::new(false)),
         packets: Arc::new(AtomicU64::new(0)),
@@ -958,14 +1150,17 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeAttachTun(
     };
     let thread_handle = handle.clone();
     let rt_handle = engine.rt.handle().clone();
-    let raw_fd = fd as i32;
-    std::thread::spawn(move || run_stack(raw_fd, client, rt_handle, thread_handle));
+
+    // Kotlin 已 detachFd()，裸 fd 的所有权在这里接管
+    let owned = Arc::new(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+    let stack_fd = owned.clone();
+    let jh = std::thread::spawn(move || run_stack(stack_fd, client, rt_handle, thread_handle));
 
     if let Ok(mut guard) = engine.tun.lock() {
-        if let Some(old) = guard.take() {
-            old.stop.store(true, Ordering::Relaxed);
-        }
         *guard = Some(handle);
+    }
+    if let Ok(mut jg) = engine.stack_thread.lock() {
+        *jg = Some(jh);
     }
     log::info!("data plane attached fd={}", fd);
     true as jboolean
@@ -1053,6 +1248,13 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeStop(_env: JNIEnv, _class
     if let Ok(mut g) = engine.client.lock() {
         *g = None;
     }
+    // 补充发现 6：nativeStop 不能只依赖 Kotlin 先调 nativeDetachTun，
+    // 顺序一改就会泄漏数据面线程与 fd。这里也置 stop。
+    if let Ok(g) = engine.tun.lock() {
+        if let Some(h) = g.as_ref() {
+            h.stop.store(true, Ordering::Relaxed);
+        }
+    }
     set_status(&engine.status, "已断开");
 }
 
@@ -1061,10 +1263,19 @@ pub extern "C" fn Java_com_pcxx_hy2box_Hy2Bridge_nativeDestroy(_env: JNIEnv, _cl
     if ptr == 0 {
         return;
     }
-    let engine = unsafe { &*(ptr as *mut Engine) };
-    if let Ok(mut guard) = engine.tun.lock() {
-        if let Some(h) = guard.take() {
-            h.stop.store(true, Ordering::Relaxed);
+    // 补充发现 7：先停数据面并 join 线程，再 drop Engine（内含 Runtime）。
+    // 用块把 &mut Engine 引用的作用域收住，避免与 Box::from_raw 的重建别名重叠。
+    {
+        let engine = unsafe { &*(ptr as *mut Engine) };
+        if let Ok(g) = engine.tun.lock() {
+            if let Some(h) = g.as_ref() {
+                h.stop.store(true, Ordering::Relaxed);
+            }
+        }
+        if let Ok(mut jg) = engine.stack_thread.lock() {
+            if let Some(j) = jg.take() {
+                let _ = j.join();
+            }
         }
     }
     unsafe {

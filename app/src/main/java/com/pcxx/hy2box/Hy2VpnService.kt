@@ -16,7 +16,14 @@ class Hy2VpnService : VpnService() {
     private var enginePtr: Long = 0L
     private val handler = Handler(Looper.getMainLooper())
 
-    // 每 400ms 把 Rust 侧的握手状态同步给界面
+    @Volatile
+    private var probing = false
+    private var probeThread: Thread? = null
+
+    @Volatile
+    private var probeSocket: java.net.DatagramSocket? = null
+
+    // 每 400ms 把 Rust 侧状态（握手 + TUN 包计数）同步给界面
     private val statusPoll = object : Runnable {
         override fun run() {
             if (enginePtr != 0L) {
@@ -53,33 +60,101 @@ class Hy2VpnService : VpnService() {
             return
         }
 
-        // Stage 1.5 握手验证版：建立 TUN 仅为验证 VPN 权限链路，
-        // 故意不 addRoute("0.0.0.0", 0)，避免劫持全局流量导致手机断网。
-        // Stage 2 做数据面时再恢复全局路由。
+        // Stage 2 · Step 1：只劫持保留测试网段 198.18.0.0/16，
+        // 全局上网不受影响；探测包会写入 TUN，供 Rust 侧读取计数。
+        // 不加 addDisallowedApplication，否则 App 自身探测包不会进 TUN。
         val builder = Builder()
             .setSession("hy2box")
             .setMtu(1500)
             .addAddress("10.0.0.2", 32)
+            .addRoute("198.18.0.0", 16)
 
-        tun = builder.establish()
-        if (tun == null) {
+        val pfd = builder.establish()
+        if (pfd == null) {
             TunnelStatus.text = "VPN 权限未授予或 TUN 建立失败"
             return
         }
 
+        // detachFd() 把裸 fd 的所有权交给 Rust；之后不能再 pfd.close()
+        val fd = pfd.detachFd()
+        tun = null
+
+        if (!Hy2Bridge.nativeAttachTun(enginePtr, fd)) {
+            TunnelStatus.text = "TUN fd 挂载失败"
+            ParcelFileDescriptor.adoptFd(fd).close()
+            return
+        }
+
+        // 握手目标不在测试网段，仍走真实网络，不受 TUN 影响
         Hy2Bridge.nativeStart(enginePtr, config.server, config.auth)
+        startProbe()
         handler.removeCallbacks(statusPoll)
         handler.post(statusPoll)
     }
 
+    // 定时往测试网段发 UDP 包，产生确定性的 TUN 入站流量
+    private fun startProbe() {
+        stopProbe()
+        probing = true
+        val sock = java.net.DatagramSocket()
+        probeSocket = sock
+        probeThread = Thread {
+            try {
+                // 故意不调用 protect()，让这个包进入 TUN
+                val addr = java.net.InetAddress.getByName("198.18.0.1")
+                val payload = ByteArray(32)
+                val packet = java.net.DatagramPacket(payload, payload.size, addr, 53)
+                while (probing && !Thread.currentThread().isInterrupted) {
+                    try {
+                        sock.send(packet)
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        Thread.sleep(200)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            } catch (t: Throwable) {
+                android.util.Log.w("hy2box", "probe thread ended", t)
+            } finally {
+                try {
+                    sock.close()
+                } catch (_: Exception) {
+                }
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun stopProbe() {
+        probing = false
+        probeThread?.interrupt()
+        probeThread = null
+        try {
+            probeSocket?.close()
+        } catch (_: Exception) {
+        }
+        probeSocket = null
+    }
+
     private fun disconnect() {
         handler.removeCallbacks(statusPoll)
+        stopProbe()
+        Hy2Bridge.nativeDetachTun(enginePtr)
         Hy2Bridge.nativeStop(enginePtr)
-        tun?.close()
+        // fd 已交给 Rust 并由其关闭，这里不要重复 close
         tun = null
         TunnelStatus.text = "已断开"
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    override fun onRevoke() {
+        disconnect()
+        super.onRevoke()
     }
 
     override fun onDestroy() {
@@ -105,10 +180,11 @@ class Hy2VpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val text = "Step 1：TUN fd 通道验证"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("hy2box")
-                .setContentText("Hysteria2 握手验证 (Stage 1.5)")
+                .setContentText(text)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(pi)
                 .build()
@@ -116,7 +192,7 @@ class Hy2VpnService : VpnService() {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
                 .setContentTitle("hy2box")
-                .setContentText("Hysteria2 握手验证 (Stage 1.5)")
+                .setContentText(text)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(pi)
                 .build()

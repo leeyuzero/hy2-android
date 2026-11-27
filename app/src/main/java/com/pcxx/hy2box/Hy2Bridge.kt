@@ -12,6 +12,8 @@ object Hy2Bridge {
     }
 
     external fun nativeInit(): Long
+    external fun nativeAttachTun(ptr: Long, fd: Int): Boolean
+    external fun nativeDetachTun(ptr: Long)
     external fun nativeStart(ptr: Long, server: String, auth: String): Boolean
     external fun nativeGetStatus(ptr: Long): String?
     external fun nativeStop(ptr: Long)
